@@ -1,16 +1,16 @@
 // build.rs
 //
-// Автоматически скачивает шрифты Noto Serif (Regular + Bold) при первой
+// Автоматически скачивает шрифты DejaVu Serif (Regular + Bold) при первой
 // сборке. Запускается cargo до компиляции.
 //
-// Источник: официальный репозиторий notofonts на GitHub через CDN jsDelivr.
-// Лицензия: SIL OFL 1.1 (разрешает встраивание и распространение).
+// Источник: npm-пакет dejavu-fonts-ttf через CDN jsDelivr.
+// Лицензия: свободная (DejaVu Fonts License, совместима с GPL/BSD).
 //
-// Noto Serif выбран за самое широкое покрытие Unicode среди свободных
-// шрифтов с засечками: поддерживает латиницу, кириллицу (включая
-// расширенную), греческий, все знаки препинания, цифры, специальные
-// символы (|, /, -, кавычки «», №, и т.д.) — гарантированно отображает
-// любые символы, которые пользователь может ввести в наименовании товара.
+// DejaVu Serif выбран за самое широкое покрытие Unicode среди свободных
+// шрифтов с засечками: 3447 глифов (против ~1000 у PT Serif и ~2000 у Noto
+// Serif). Поддерживает латиницу, кириллицу (включая расширенную), греческий,
+// математику, знаки препинания, технические символы — практически всё,
+// что пользователь может ввести в наименовании товара.
 //
 // Шрифты сохраняются в OUT_DIR (официальное место для выходных данных
 // build script) — это обходит sandbox Cargo, который не позволяет
@@ -23,13 +23,13 @@ use std::process::Command;
 
 const FONTS: &[(&str, &str, &str)] = &[
     (
-        "noto-serif-regular.ttf",
-        "https://cdn.jsdelivr.net/gh/notofonts/notofonts.github.io@main/fonts/NotoSerif/hinted/ttf/NotoSerif-Regular.ttf",
+        "dejavu-serif-regular.ttf",
+        "https://cdn.jsdelivr.net/npm/dejavu-fonts-ttf@2.37.3/ttf/DejaVuSerif.ttf",
         "FONT_REGULAR_PATH",
     ),
     (
-        "noto-serif-bold.ttf",
-        "https://cdn.jsdelivr.net/gh/notofonts/notofonts.github.io@main/fonts/NotoSerif/hinted/ttf/NotoSerif-Bold.ttf",
+        "dejavu-serif-bold.ttf",
+        "https://cdn.jsdelivr.net/npm/dejavu-fonts-ttf@2.37.3/ttf/DejaVuSerif-Bold.ttf",
         "FONT_BOLD_PATH",
     ),
 ];

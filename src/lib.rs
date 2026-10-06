@@ -560,14 +560,324 @@ pub mod model {
 }
 
 // ============================================================================
+// МОДУЛЬ history — база данных распечатанных заявок в RON-формате
+// ============================================================================
+
+/// Модуль истории распечаток.
+///
+/// Каждая распечатанная заявка сохраняется в отдельный `.ron`-файл в
+/// специальной папке (по умолчанию — `История/` рядом с exe). Файлы
+/// имеют читаемый RON-формат (Rusty Object Notation), который можно
+/// открыть в любом текстовом редакторе.
+///
+/// Внутри программы доступен просмотр истории: список всех распечатанных
+/// заявок с номером, датой, итогом и количеством строк.
+pub mod history {
+    use crate::model::Document;
+    use chrono::Local;
+    use serde::{Deserialize, Serialize};
+    use std::path::{Path, PathBuf};
+
+    /// Одна запись в истории — упрощённая копия распечатанной заявки.
+    ///
+    /// Хранится в RON-файле в папке истории. Содержит всё, что нужно
+    /// для просмотра: номер, дату, итог, строки товаров, путь к PDF.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct HistoryEntry {
+        /// Номер заявки (например, «DZHOД123456»).
+        pub number: String,
+        /// Дата создания (например, «6 октября 2026 г.»).
+        pub date: String,
+        /// ISO-временная метка создания (для сортировки).
+        pub timestamp: String,
+        /// Количество наименований.
+        pub items_count: usize,
+        /// Итоговая сумма в рублях.
+        pub total: f64,
+        /// Сумма прописью (например, «Двенадцать тысяч четыреста рублей 00 копеек»).
+        pub total_words: String,
+        /// Строки товаров (упрощённая структура — без строковых полей).
+        pub items: Vec<HistoryItem>,
+        /// Путь к PDF-файлу (если сохранён).
+        pub pdf_path: Option<String>,
+    }
+
+    /// Одна строка товара в записи истории.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct HistoryItem {
+        pub index: u32,
+        pub name: String,
+        pub qty: f64,
+        pub unit: String,
+        pub price: f64,
+        pub sum: f64,
+    }
+
+    impl HistoryEntry {
+        /// Создаёт запись истории из документа.
+        pub fn from_document(doc: &Document, pdf_path: Option<&Path>) -> Self {
+            let total = doc.total();
+            let total_words = crate::money_words::amount_to_words(total);
+            let items: Vec<HistoryItem> = doc
+                .filled_lines()
+                .into_iter()
+                .enumerate()
+                .map(|(i, line)| HistoryItem {
+                    index: (i + 1) as u32,
+                    name: line.name.clone(),
+                    qty: line.qty_value().unwrap_or(0.0),
+                    unit: line.unit.as_str().to_string(),
+                    price: line.price_value().unwrap_or(0.0),
+                    sum: line.sum_value().unwrap_or(0.0),
+                })
+                .collect();
+
+            Self {
+                number: doc.number.clone(),
+                date: doc.date.clone(),
+                timestamp: Local::now().to_rfc3339(),
+                items_count: doc.filled_count(),
+                total,
+                total_words,
+                items,
+                pdf_path: pdf_path.map(|p| p.display().to_string()),
+            }
+        }
+
+        /// Возвращает имя RON-файла для этой записи.
+        /// Формат: «Заявка DZHOД123456 2026-10-06 15-30-45.ron»
+        /// (с временной меткой, чтобы избежать коллизий имён).
+        pub fn ron_filename(&self) -> String {
+            // Извлекаем дату-время из timestamp для имени файла.
+            let safe_ts = self
+                .timestamp
+                .chars()
+                .map(|c| match c {
+                    ':' | ' ' | 'T' => '-',
+                    '+' => 'p',
+                    '.' => '-',
+                    _ => c,
+                })
+                .collect::<String>();
+            format!("Заявка {} {}.ron", self.number, safe_ts)
+        }
+    }
+
+    /// Менеджер истории: загрузка, сохранение, список.
+    pub struct HistoryStore {
+        /// Папка, где хранятся RON-файлы истории.
+        pub dir: PathBuf,
+    }
+
+    impl HistoryStore {
+        /// Создаёт менеджер истории и гарантирует, что папка существует.
+        pub fn new(dir: PathBuf) -> Self {
+            let _ = std::fs::create_dir_all(&dir);
+            Self { dir }
+        }
+
+        /// Сохраняет запись истории в RON-файл.
+        /// Возвращает путь к созданному файлу.
+        pub fn save(&self, entry: &HistoryEntry) -> Result<PathBuf, String> {
+            let _ = std::fs::create_dir_all(&self.dir);
+            let filename = entry.ron_filename();
+            let path = self.dir.join(&filename);
+            // Красивое форматирование RON с переносами строк.
+            let pretty = ron::ser::PrettyConfig::default()
+                .depth_limit(4)
+                .separate_tuple_members(true)
+                .enumerate_arrays(true);
+            let ron_str = ron::ser::to_string_pretty(entry, pretty)
+                .map_err(|e| format!("Ошибка сериализации RON: {}", e))?;
+            std::fs::write(&path, ron_str)
+                .map_err(|e| format!("Не удалось записать {}: {}", path.display(), e))?;
+            Ok(path)
+        }
+
+        /// Загружает все записи истории, отсортированные по убыванию даты
+        /// (самые свежие — первыми).
+        pub fn list(&self) -> Vec<HistoryEntry> {
+            let mut entries = Vec::new();
+            if let Ok(rd) = std::fs::read_dir(&self.dir) {
+                for entry in rd.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) == Some("ron") {
+                        if let Ok(content) = std::fs::read_to_string(&path) {
+                            if let Ok(hist) = ron::from_str::<HistoryEntry>(&content) {
+                                entries.push(hist);
+                            }
+                        }
+                    }
+                }
+            }
+            // Сортировка: свежие первыми (по timestamp, по убыванию).
+            entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+            entries
+        }
+
+        /// Удаляет запись истории по её номеру и timestamp.
+        pub fn delete(&self, number: &str, timestamp: &str) -> Result<(), String> {
+            if let Ok(rd) = std::fs::read_dir(&self.dir) {
+                for entry in rd.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) != Some("ron") {
+                        continue;
+                    }
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        if let Ok(hist) = ron::from_str::<HistoryEntry>(&content) {
+                            if hist.number == number && hist.timestamp == timestamp {
+                                std::fs::remove_file(&path)
+                                    .map_err(|e| format!("Не удалось удалить: {}", e))?;
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+            Err("Запись не найдена".to_string())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::model::{Document, LineItem, Unit};
+
+        fn make_doc() -> Document {
+            Document {
+                number: "DZHOД123456".to_string(),
+                date: "6 октября 2026 г.".to_string(),
+                lines: vec![
+                    LineItem {
+                        name: "Товар A".to_string(),
+                        qty: "2".to_string(),
+                        unit: Unit::Sht,
+                        price: "100".to_string(),
+                    },
+                    LineItem {
+                        name: "Товар B".to_string(),
+                        qty: "1".to_string(),
+                        unit: Unit::Kkt,
+                        price: "500".to_string(),
+                    },
+                ],
+            }
+        }
+
+        #[test]
+        fn history_entry_from_document() {
+            let doc = make_doc();
+            let entry = HistoryEntry::from_document(&doc, None);
+            assert_eq!(entry.number, "DZHOД123456");
+            assert_eq!(entry.date, "6 октября 2026 г.");
+            assert_eq!(entry.items_count, 2);
+            assert_eq!(entry.total, 700.0);
+            assert_eq!(entry.items.len(), 2);
+            assert_eq!(entry.items[0].name, "Товар A");
+            assert_eq!(entry.items[0].sum, 200.0);
+            assert!(entry.total_words.contains("рублей"));
+        }
+
+        #[test]
+        fn ron_filename_is_unique() {
+            let doc = make_doc();
+            let mut entry = HistoryEntry::from_document(&doc, None);
+            let name1 = entry.ron_filename();
+            // Меняем timestamp — имя должно измениться.
+            entry.timestamp = "2026-10-06T15:30:45+00:00".to_string();
+            let name2 = entry.ron_filename();
+            assert_ne!(name1, name2);
+            assert!(name1.starts_with("Заявка DZHOД123456"));
+            assert!(name1.ends_with(".ron"));
+        }
+
+        #[test]
+        fn save_and_list_history() {
+            let tmp = std::env::temp_dir().join("zayavka_history_test");
+            let _ = std::fs::remove_dir_all(&tmp);
+            let store = HistoryStore::new(tmp.clone());
+
+            let doc = make_doc();
+            let entry = HistoryEntry::from_document(&doc, None);
+            let path = store.save(&entry).expect("save failed");
+            assert!(path.exists());
+
+            let list = store.list();
+            assert_eq!(list.len(), 1);
+            assert_eq!(list[0].number, "DZHOД123456");
+            assert_eq!(list[0].total, 700.0);
+
+            // Проверим, что RON-файл читаемый.
+            let content = std::fs::read_to_string(&path).unwrap();
+            assert!(content.contains("DZHOД123456"));
+            assert!(content.contains("Товар A"));
+
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+
+        #[test]
+        fn delete_history_entry() {
+            let tmp = std::env::temp_dir().join("zayavka_history_test_del");
+            let _ = std::fs::remove_dir_all(&tmp);
+            let store = HistoryStore::new(tmp.clone());
+
+            let doc = make_doc();
+            let entry = HistoryEntry::from_document(&doc, None);
+            let _ = store.save(&entry).expect("save failed");
+            assert_eq!(store.list().len(), 1);
+
+            store
+                .delete(&entry.number, &entry.timestamp)
+                .expect("delete failed");
+            assert_eq!(store.list().len(), 0);
+
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+
+        #[test]
+        fn list_sorted_by_date_desc() {
+            let tmp = std::env::temp_dir().join("zayavka_history_test_sort");
+            let _ = std::fs::remove_dir_all(&tmp);
+            let store = HistoryStore::new(tmp.clone());
+
+            // Три записи с разными timestamp.
+            let mut e1 = HistoryEntry::from_document(&make_doc(), None);
+            e1.timestamp = "2026-10-01T10:00:00+00:00".to_string();
+            e1.number = "DZHOД000001".to_string();
+            let _ = store.save(&e1);
+
+            let mut e2 = HistoryEntry::from_document(&make_doc(), None);
+            e2.timestamp = "2026-10-06T15:00:00+00:00".to_string();
+            e2.number = "DZHOД000002".to_string();
+            let _ = store.save(&e2);
+
+            let mut e3 = HistoryEntry::from_document(&make_doc(), None);
+            e3.timestamp = "2026-10-03T12:00:00+00:00".to_string();
+            e3.number = "DZHOД000003".to_string();
+            let _ = store.save(&e3);
+
+            let list = store.list();
+            assert_eq!(list.len(), 3);
+            // Свежие первыми: e2 (6 окт) → e3 (3 окт) → e1 (1 окт).
+            assert_eq!(list[0].number, "DZHOД000002");
+            assert_eq!(list[1].number, "DZHOД000003");
+            assert_eq!(list[2].number, "DZHOД000001");
+
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+    }
+}
+
+// ============================================================================
 // МОДУЛЬ pdf — генерация PDF через genpdf
 // ============================================================================
 
 /// Модуль генерации PDF-документа.
 ///
-/// Использует крейт `genpdf` со встроенным шрифтом PT Serif (SIL OFL 1.1)
-/// через `include_bytes!`. Файлы шрифта автоматически скачиваются
-/// при первой сборке через `build.rs`.
+/// Использует крейт `genpdf` со встроенным шрифтом DejaVu Serif
+/// (3447 глифов — самое широкое покрытие Unicode среди свободных шрифтов
+/// с засечками) через `include_bytes!`. Файлы шрифта автоматически
+/// скачиваются при первой сборке через `build.rs`.
 pub mod pdf {
     use crate::fmt;
     use crate::model::{self, Document};
@@ -578,9 +888,9 @@ pub mod pdf {
     use std::path::Path;
 
     // Шрифты вшиты в бинарник на этапе компиляции.
-    // Noto Serif — самое широкое покрытие Unicode среди свободных шрифтов
-    // с засечками: латиница, кириллица (включая расширенную), греческий,
-    // все знаки препинания, цифры, специальные символы.
+    // DejaVu Serif — самое широкое покрытие Unicode среди свободных шрифтов
+    // с засечками: 3447 глифов. Поддерживает латиницу, кириллицу (включая
+    // расширенную), греческий, математику, технические символы, и т.д.
     //
     // Пути к шрифтам передаются через cargo:rustc-env из build.rs,
     // который скачивает их в OUT_DIR (обходит sandbox Cargo).
@@ -612,6 +922,7 @@ pub mod pdf {
         pdf.push(render_title(&doc.number, &doc.date));
         pdf.push(render_supplier_block());
         pdf.push(render_table(doc));
+        pdf.push(render_total_row(doc));
         pdf.push(render_total_count(doc));
         pdf.push(render_amount_in_words(doc));
         pdf.push(render_payment_block(doc));
@@ -685,33 +996,43 @@ pub mod pdf {
             let price_str = format_price(line.price_value());
             let sum_str = fmt::format_money(sum);
 
+            // Все числовые колонки — по центру (по запросу пользователя).
             let row: Vec<Box<dyn Element>> = vec![
                 Box::new(styled_paragraph(&idx.to_string(), Style::new(), Alignment::Center)),
                 Box::new(styled_paragraph(&line.name, Style::new(), Alignment::Left)),
                 Box::new(styled_paragraph(&qty_str, Style::new(), Alignment::Center)),
                 Box::new(styled_paragraph(line.unit.as_str(), Style::new(), Alignment::Center)),
-                Box::new(styled_paragraph(&price_str, Style::new(), Alignment::Right)),
-                Box::new(styled_paragraph(&sum_str, Style::new(), Alignment::Right)),
+                Box::new(styled_paragraph(&price_str, Style::new(), Alignment::Center)),
+                Box::new(styled_paragraph(&sum_str, Style::new(), Alignment::Center)),
             ];
             let _ = table.push_row(row);
             idx += 1;
         }
 
+        // Итоговая строка УБРАНА из таблицы — теперь «Итого:» отдельной
+        // строкой под таблицей (по запросу пользователя).
+        layout.push(table);
+        layout.push(el::Break::new(0.2));
+        layout
+    }
+
+    /// Отдельная строка «Итого: <сумма>» под таблицей (за её пределами).
+    fn render_total_row(doc: &Document) -> el::LinearLayout {
+        let mut layout = el::LinearLayout::vertical();
         let total = doc.total();
         let total_str = fmt::format_money(total);
         let bold = Style::new().bold();
-        let total_row: Vec<Box<dyn Element>> = vec![
-            Box::new(styled_paragraph("", bold, Alignment::Center)),
-            Box::new(styled_paragraph("", bold, Alignment::Left)),
-            Box::new(styled_paragraph("", bold, Alignment::Center)),
-            Box::new(styled_paragraph("Итого:", bold, Alignment::Right)),
-            Box::new(styled_paragraph("", bold, Alignment::Right)),
-            Box::new(styled_paragraph(&total_str, bold, Alignment::Right)),
+        // Таблица 1×2: «Итого:» слева, сумма справа — выравнивается по правому краю.
+        let frame = el::FrameCellDecorator::new(false, false, false);
+        let mut table = el::TableLayout::new(vec![5, 2]);
+        table.set_cell_decorator(frame);
+        let row: Vec<Box<dyn Element>> = vec![
+            Box::new(styled_paragraph("Итого:", bold.clone(), Alignment::Right)),
+            Box::new(styled_paragraph(&total_str, bold, Alignment::Center)),
         ];
-        let _ = table.push_row(total_row);
-
+        let _ = table.push_row(row);
         layout.push(table);
-        layout.push(el::Break::new(0.4));
+        layout.push(el::Break::new(0.3));
         layout
     }
 
@@ -833,6 +1154,7 @@ pub mod pdf {
 /// Модуль графического интерфейса на egui.
 pub mod gui {
     use crate::fmt;
+    use crate::history::{HistoryEntry, HistoryStore};
     use crate::model::{self, Document, LineItem, Unit};
     use crate::pdf;
     use crate::APP_NAME;
@@ -848,13 +1170,20 @@ pub mod gui {
         pub doc: Document,
         pub draft_path: PathBuf,
         pub pdf_dir: PathBuf,
+        pub history_dir: PathBuf,
         pub status_message: String,
         pub last_filled_signature: u64,
         pub show_new_doc_dialog: bool,
+        /// Окно истории распечаток.
+        pub show_history_window: bool,
+        /// Кэш списка истории (обновляется при открытии окна).
+        pub history_entries: Vec<HistoryEntry>,
+        /// Индекс выбранной записи в истории (для просмотра деталей).
+        pub history_selected: Option<usize>,
     }
 
     impl App {
-        pub fn new(draft_path: PathBuf, pdf_dir: PathBuf) -> Self {
+        pub fn new(draft_path: PathBuf, pdf_dir: PathBuf, history_dir: PathBuf) -> Self {
             let mut doc = load_draft(&draft_path).unwrap_or_else(|| Document {
                 number: model::generate_number(),
                 date: fmt::today_string(),
@@ -871,9 +1200,13 @@ pub mod gui {
                 doc,
                 draft_path,
                 pdf_dir,
+                history_dir,
                 status_message: String::new(),
                 last_filled_signature,
                 show_new_doc_dialog: false,
+                show_history_window: false,
+                history_entries: Vec::new(),
+                history_selected: None,
             }
         }
 
@@ -910,6 +1243,23 @@ pub mod gui {
             match pdf::generate_pdf(&self.doc, &path) {
                 Ok(()) => {
                     self.status_message = format!("PDF сохранён: {}", path.display());
+
+                    // Сохраняем запись в историю (RON-формат).
+                    let entry = HistoryEntry::from_document(&self.doc, Some(&path));
+                    let store = HistoryStore::new(self.history_dir.clone());
+                    match store.save(&entry) {
+                        Ok(ron_path) => {
+                            self.status_message.push_str(&format!(
+                                "\nИстория: {}", ron_path.display()
+                            ));
+                        }
+                        Err(e) => {
+                            self.status_message.push_str(&format!(
+                                "\nНе удалось сохранить историю: {}", e
+                            ));
+                        }
+                    }
+
                     if let Err(e) = open::that(&path) {
                         self.status_message = format!(
                             "PDF создан, но не удалось открыть просмотрщик: {}", e
@@ -979,6 +1329,23 @@ pub mod gui {
                 }
             }
 
+            // Окно истории распечаток.
+            if self.show_history_window {
+                let mut open = true;
+                egui::Window::new("📋 История распечаток")
+                    .collapsible(false)
+                    .resizable(true)
+                    .default_width(900.0)
+                    .default_height(600.0)
+                    .open(&mut open)
+                    .show(ctx, |ui| {
+                        self.render_history(ui);
+                    });
+                if !open {
+                    self.show_history_window = false;
+                }
+            }
+
             egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
                 ui.add_space(2.0);
                 ui.horizontal(|ui| { ui.label(&self.status_message); });
@@ -1001,6 +1368,14 @@ pub mod gui {
                     ui.separator();
                     if ui.button("+ Добавить строку").clicked() {
                         self.add_empty_line();
+                    }
+                    ui.separator();
+                    if ui.button("📋 История").clicked() {
+                        // Обновляем кэш истории при открытии окна.
+                        let store = HistoryStore::new(self.history_dir.clone());
+                        self.history_entries = store.list();
+                        self.history_selected = None;
+                        self.show_history_window = true;
                     }
                 });
                 ui.add_space(4.0);
@@ -1148,6 +1523,178 @@ pub mod gui {
                     ui.end_row();
                 });
             ui.add_space(4.0);
+        }
+
+        /// Рисует окно истории распечаток.
+        fn render_history(&mut self, ui: &mut egui::Ui) {
+            ui.horizontal(|ui| {
+                ui.heading(format!(
+                    "История распечаток ({} записей)",
+                    self.history_entries.len()
+                ));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("🔄 Обновить").clicked() {
+                        let store = HistoryStore::new(self.history_dir.clone());
+                        self.history_entries = store.list();
+                        self.history_selected = None;
+                    }
+                    if ui.button("📂 Открыть папку").clicked() {
+                        let _ = open::that(&self.history_dir);
+                    }
+                });
+            });
+            ui.separator();
+
+            if self.history_entries.is_empty() {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(40.0);
+                    ui.label("История пуста.");
+                    ui.label(
+                        "Сформируйте первую заявку кнопкой «Сформировать PDF» — \
+                         и она появится здесь.",
+                    );
+                });
+                return;
+            }
+
+            // Список записей слева, детали выбранной — справа.
+            let selected_idx = self.history_selected;
+            let mut new_selection = selected_idx;
+
+            egui::SidePanel::left("history_list")
+                .resizable(true)
+                .default_width(380.0)
+                .show_inside(ui, |ui| {
+                    ui.heading("Заявки:");
+                    ui.separator();
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        for (i, entry) in self.history_entries.iter().enumerate() {
+                            let is_selected = selected_idx == Some(i);
+                            let total_str = fmt::format_money(entry.total);
+                            let button_text = format!(
+                                "{}\n{} от {} — {} ({} наим.)",
+                                entry.number,
+                                entry.date,
+                                entry.timestamp.chars().take(10).collect::<String>(),
+                                total_str,
+                                entry.items_count,
+                            );
+                            let resp = ui.add_sized(
+                                [ui.available_width(), 56.0],
+                                egui::SelectableLabel::new(is_selected, &button_text),
+                            );
+                            if resp.clicked() {
+                                new_selection = Some(i);
+                            }
+                        }
+                    });
+                });
+
+            self.history_selected = new_selection;
+
+            // Детали выбранной записи.
+            egui::CentralPanel::default().show_inside(ui, |ui| {
+                if let Some(idx) = self.history_selected {
+                    if let Some(entry) = self.history_entries.get(idx) {
+                        let entry_clone = entry.clone();
+                        ui.heading(format!("Заявка № {}", entry.number));
+                        ui.add_space(4.0);
+                        egui::Grid::new("history_detail_grid")
+                            .num_columns(2)
+                            .striped(true)
+                            .min_col_width(120.0)
+                            .show(ui, |ui| {
+                                ui.strong("Дата:");
+                                ui.label(&entry.date);
+                                ui.end_row();
+                                ui.strong("Создано:");
+                                ui.label(&entry.timestamp);
+                                ui.end_row();
+                                ui.strong("Наименований:");
+                                ui.label(entry.items_count.to_string());
+                                ui.end_row();
+                                ui.strong("Итого:");
+                                ui.label(fmt::format_money(entry.total));
+                                ui.end_row();
+                                ui.strong("Прописью:");
+                                ui.label(&entry.total_words);
+                                ui.end_row();
+                                if let Some(pdf) = &entry.pdf_path {
+                                    ui.strong("PDF:");
+                                    ui.label(pdf);
+                                    ui.end_row();
+                                }
+                            });
+
+                        ui.add_space(8.0);
+                        ui.heading("Строки товаров:");
+                        ui.separator();
+
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            egui::Grid::new("history_items_grid")
+                                .num_columns(6)
+                                .striped(true)
+                                .min_col_width(50.0)
+                                .show(ui, |ui| {
+                                    ui.strong("№");
+                                    ui.strong("Товар");
+                                    ui.strong("кол-во");
+                                    ui.strong("ед.");
+                                    ui.strong("цена");
+                                    ui.strong("сумма");
+                                    ui.end_row();
+                                    for item in &entry_clone.items {
+                                        ui.label(item.index.to_string());
+                                        ui.label(&item.name);
+                                        ui.label(format_qty_short(item.qty));
+                                        ui.label(&item.unit);
+                                        ui.label(fmt::format_money(item.price));
+                                        ui.label(fmt::format_money(item.sum));
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if let Some(pdf) = &entry_clone.pdf_path {
+                                if ui.button("📄 Открыть PDF").clicked() {
+                                    let _ = open::that(pdf);
+                                }
+                            }
+                            if ui.button("🗑 Удалить из истории").clicked() {
+                                let store = HistoryStore::new(self.history_dir.clone());
+                                match store.delete(&entry_clone.number, &entry_clone.timestamp) {
+                                    Ok(()) => {
+                                        self.history_entries = store.list();
+                                        self.history_selected = None;
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Не удалось удалить: {}", e);
+                                    }
+                                }
+                            }
+                        });
+                    } else {
+                        ui.label("Запись не найдена.");
+                    }
+                } else {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(40.0);
+                        ui.label("Выберите заявку слева для просмотра деталей.");
+                    });
+                }
+            });
+        }
+    }
+
+    /// Вспомогательная функция: форматирование количества в коротком виде
+    /// (целое — без дробной части).
+    fn format_qty_short(v: f64) -> String {
+        if v.fract().abs() < 1e-9 {
+            format!("{}", v as i64)
+        } else {
+            format!("{:.3}", v).replace('.', ",")
         }
     }
 

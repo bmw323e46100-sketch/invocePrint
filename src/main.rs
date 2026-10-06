@@ -10,11 +10,11 @@ use zayavka::gui;
 use zayavka::APP_NAME;
 
 fn main() -> eframe::Result<()> {
-    // Пути: черновик и PDF сохраняются рядом с исполняемым файлом,
+    // Пути: черновик, PDF и история сохраняются рядом с исполняемым файлом,
     // если это возможно; иначе — в каталоге данных пользователя.
-    let (draft_path, pdf_dir) = resolve_paths();
+    let (draft_path, pdf_dir, history_dir) = resolve_paths();
 
-    let app = gui::App::new(draft_path, pdf_dir);
+    let app = gui::App::new(draft_path, pdf_dir, history_dir);
 
     let viewport = egui::ViewportBuilder::default()
         .with_inner_size([gui::WINDOW_WIDTH, gui::WINDOW_HEIGHT])
@@ -33,10 +33,10 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-/// Определяет пути для черновика и PDF:
+/// Определяет пути для черновика, PDF и истории:
 /// - предпочтительно: рядом с исполняемым файлом (current_exe).
 /// - запас: каталог данных приложения (home/.local/share/zayavka или %APPDATA%/zayavka).
-fn resolve_paths() -> (PathBuf, PathBuf) {
+fn resolve_paths() -> (PathBuf, PathBuf, PathBuf) {
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|p| p.to_path_buf()));
@@ -48,7 +48,8 @@ fn resolve_paths() -> (PathBuf, PathBuf) {
             let _ = std::fs::remove_file(&probe);
             let draft = dir.join("zayavka_draft.json");
             let pdf_dir = dir.join("Заявки");
-            return (draft, pdf_dir);
+            let history_dir = dir.join("История");
+            return (draft, pdf_dir, history_dir);
         }
     }
 
@@ -57,7 +58,8 @@ fn resolve_paths() -> (PathBuf, PathBuf) {
     let _ = std::fs::create_dir_all(&base);
     let draft = base.join("zayavka_draft.json");
     let pdf_dir = base.join("Заявки");
-    (draft, pdf_dir)
+    let history_dir = base.join("История");
+    (draft, pdf_dir, history_dir)
 }
 
 /// Возвращает каталог данных приложения в зависимости от платформы.
