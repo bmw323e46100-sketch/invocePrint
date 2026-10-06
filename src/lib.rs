@@ -1,0 +1,1142 @@
+//! Библиотечная часть приложения «Заявка на отгрузку».
+//!
+//! Весь код собран в один файл, чтобы пользователю не приходилось
+//! создавать множество отдельных файлов модулей.
+//!
+//! Содержит:
+//! - [`fmt`] — форматирование чисел и дат.
+//! - [`model`] — структуры данных и расчёт итогов.
+//! - [`money_words`] — сумма прописью.
+//! - [`pdf`] — генерация PDF-документа.
+//! - [`gui`] — графический интерфейс на egui.
+
+/// Имя приложения для интерфейса.
+pub const APP_NAME: &str = "Заявка на отгрузку";
+
+// ============================================================================
+// МОДУЛЬ fmt — форматирование чисел и дат
+// ============================================================================
+
+/// Модуль форматирования чисел и дат по русским правилам.
+///
+/// - Разделитель тысяч — неразрывный пробел (U+00A0).
+/// - Десятичный разделитель — запятая, два знака после запятой.
+/// - В полях ввода принимаются и точка, и запятая как десятичный разделитель.
+pub mod fmt {
+    use chrono::{Datelike, Local, NaiveDate};
+
+    /// Неразрывный пробел — разделитель разрядов в русской типографике.
+    pub const NBSP: char = '\u{a0}';
+
+    /// Месяцы в родительном падеже, строчными буквами.
+    const MONTHS_RU_GENITIVE: [&str; 12] = [
+        "января", "февраля", "марта", "апреля", "мая", "июня",
+        "июля", "августа", "сентября", "октября", "ноября", "декабря",
+    ];
+
+    /// Форматирует денежную сумму в русской нотации.
+    /// Пример: `47100.0` → `"47 100,00"` (с неразрывным пробелом).
+    pub fn format_money(value: f64) -> String {
+        let neg = value < 0.0;
+        let abs = value.abs();
+        let total_kopecks = (abs * 100.0).round() as i64;
+        let rubles = total_kopecks / 100;
+        let kopecks = total_kopecks % 100;
+
+        let mut s = format_int_groups(rubles);
+        s.push(',');
+        s.push_str(&format!("{:02}", kopecks));
+        if neg { format!("-{}", s) } else { s }
+    }
+
+    /// Форматирует целое число с разделителем разрядов (неразрывный пробел).
+    pub fn format_int_groups(n: i64) -> String {
+        let neg = n < 0;
+        let mut n = n.unsigned_abs() as u64;
+        if n == 0 { return "0".to_string(); }
+        let mut groups: Vec<u64> = Vec::new();
+        while n > 0 {
+            groups.push(n % 1000);
+            n /= 1000;
+        }
+        groups.reverse();
+        let mut s = String::new();
+        for (i, g) in groups.iter().enumerate() {
+            if i > 0 {
+                s.push(NBSP);
+                s.push_str(&format!("{:03}", g));
+            } else {
+                s.push_str(&format!("{}", g));
+            }
+        }
+        if neg { s = format!("-{}", s); }
+        s
+    }
+
+    /// Округляет до целого рубля и форматирует с разделителем разрядов.
+    pub fn format_rubles_rounded(value: f64) -> String {
+        let rounded = value.round() as i64;
+        format_int_groups(rounded)
+    }
+
+    /// Разбирает пользовательский ввод: принимает и точку, и запятую,
+    /// игнорирует пробелы и неразрывные пробелы.
+    pub fn parse_number(s: &str) -> Option<f64> {
+        let cleaned: String = s
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '\u{a0}')
+            .map(|c| if c == ',' { '.' } else { c })
+            .collect();
+        if cleaned.is_empty() { return None; }
+        cleaned.parse::<f64>().ok()
+    }
+
+    /// Форматирует дату: «25 сентября 2026 г.».
+    pub fn format_date_ru(date: NaiveDate) -> String {
+        let day = date.day();
+        let month_idx = date.month() as usize;
+        let year = date.year();
+        format!("{} {} {} г.", day, MONTHS_RU_GENITIVE[month_idx - 1], year)
+    }
+
+    /// Текущая системная дата в формате `format_date_ru`.
+    pub fn today_string() -> String {
+        format_date_ru(Local::now().date_naive())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn money_basic() {
+            assert_eq!(format_money(47100.0), "47\u{a0}100,00");
+            assert_eq!(format_money(0.0), "0,00");
+            assert_eq!(format_money(1.5), "1,50");
+            assert_eq!(format_money(1234.5), "1\u{a0}234,50");
+        }
+
+        #[test]
+        fn money_negative() {
+            assert_eq!(format_money(-1234.5), "-1\u{a0}234,50");
+        }
+
+        #[test]
+        fn money_rounding() {
+            assert_eq!(format_money(0.005), "0,01");
+            assert_eq!(format_money(0.004), "0,00");
+            assert_eq!(format_money(12400.0), "12\u{a0}400,00");
+        }
+
+        #[test]
+        fn money_test_case_from_spec() {
+            assert_eq!(format_money(9100.0), "9\u{a0}100,00");
+            assert_eq!(format_money(1780.0), "1\u{a0}780,00");
+            assert_eq!(format_money(1520.0), "1\u{a0}520,00");
+            assert_eq!(format_money(12400.0), "12\u{a0}400,00");
+        }
+
+        #[test]
+        fn money_million() {
+            assert_eq!(format_money(1_000_000.0), "1\u{a0}000\u{a0}000,00");
+        }
+
+        #[test]
+        fn parse_accepts_comma_and_dot() {
+            assert_eq!(parse_number("9100"), Some(9100.0));
+            assert_eq!(parse_number("9100,00"), Some(9100.0));
+            assert_eq!(parse_number("9100.00"), Some(9100.0));
+            assert_eq!(parse_number("9 100,00"), Some(9100.0));
+            assert_eq!(parse_number("9\u{a0}100,00"), Some(9100.0));
+            assert_eq!(parse_number(" 12 400 "), Some(12400.0));
+        }
+
+        #[test]
+        fn parse_invalid_returns_none() {
+            assert_eq!(parse_number(""), None);
+            assert_eq!(parse_number("   "), None);
+            assert_eq!(parse_number("abc"), None);
+        }
+
+        #[test]
+        fn rubles_rounded_format() {
+            assert_eq!(format_rubles_rounded(12400.0), "12\u{a0}400");
+            assert_eq!(format_rubles_rounded(12400.40), "12\u{a0}400");
+            assert_eq!(format_rubles_rounded(12400.50), "12\u{a0}401");
+            assert_eq!(format_rubles_rounded(47100.0), "47\u{a0}100");
+        }
+
+        #[test]
+        fn date_format_basic() {
+            let d = NaiveDate::from_ymd_opt(2026, 9, 25).unwrap();
+            assert_eq!(format_date_ru(d), "25 сентября 2026 г.");
+        }
+
+        #[test]
+        fn date_all_months() {
+            let months = [
+                "января", "февраля", "марта", "апреля", "мая", "июня",
+                "июля", "августа", "сентября", "октября", "ноября", "декабря",
+            ];
+            for (i, m) in months.iter().enumerate() {
+                let d = NaiveDate::from_ymd_opt(2026, (i + 1) as u32, 15).unwrap();
+                assert!(format_date_ru(d).contains(m), "month {} failed", i + 1);
+            }
+        }
+
+        #[test]
+        fn date_no_leading_zero() {
+            let d = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+            assert_eq!(format_date_ru(d), "5 января 2026 г.");
+        }
+    }
+}
+
+// ============================================================================
+// МОДУЛЬ money_words — сумма прописью
+// ============================================================================
+
+/// Модуль преобразования суммы в слова на русском языке.
+///
+/// Эталон: `47100.00` → «Сорок семь тысяч сто рублей 00 копеек».
+pub mod money_words {
+    /// Возвращает сумму прописью для переданного значения в рублях.
+    pub fn amount_to_words(value: f64) -> String {
+        let total_kopecks = (value * 100.0).round() as i64;
+        let rubles = total_kopecks.div_euclid(100);
+        let kopecks = total_kopecks.rem_euclid(100);
+
+        let mut s = rubles_to_words(rubles);
+        if let Some(first) = s.chars().next() {
+            let upper: String = first.to_uppercase().collect();
+            s = format!("{}{}", upper, &s[first.len_utf8()..]);
+        }
+        s.push(' ');
+        s.push_str(&kopecks_word(kopecks));
+        s
+    }
+
+    fn ruble_word(n: i64) -> &'static str { declension_ru(n, "рубль", "рубля", "рублей") }
+    fn thousand_word(n: i64) -> &'static str { declension_ru(n, "тысяча", "тысячи", "тысяч") }
+    fn million_word(n: i64) -> &'static str { declension_ru(n, "миллион", "миллиона", "миллионов") }
+
+    fn kopecks_word(kopecks: i64) -> String {
+        let word = declension_ru(kopecks, "копейка", "копейки", "копеек");
+        format!("{:02} {}", kopecks, word)
+    }
+
+    fn declension_ru(n: i64, one: &'static str, few: &'static str, many: &'static str) -> &'static str {
+        let n = n.unsigned_abs();
+        let last_two = n % 100;
+        let last = n % 10;
+        if last_two >= 11 && last_two <= 14 { return many; }
+        match last {
+            1 => one,
+            2 | 3 | 4 => few,
+            _ => many,
+        }
+    }
+
+    fn rubles_to_words(rubles: i64) -> String {
+        if rubles == 0 { return "0 рублей".to_string(); }
+        let mut parts: Vec<String> = Vec::new();
+        let mut n = rubles;
+        let mut millions = 0i64;
+        let mut thousands = 0i64;
+        let units;
+        if n >= 1_000_000 { millions = n / 1_000_000; n %= 1_000_000; }
+        if n >= 1_000 { thousands = n / 1_000; n %= 1_000; }
+        units = n;
+        if millions > 0 {
+            parts.push(format!("{} {}", three_digit_words(millions, Gender::Masculine), million_word(millions)));
+        }
+        if thousands > 0 {
+            parts.push(format!("{} {}", three_digit_words(thousands, Gender::Feminine), thousand_word(thousands)));
+        }
+        if units > 0 {
+            parts.push(format!("{} {}", three_digit_words(units, Gender::Masculine), ruble_word(units)));
+        } else if !parts.is_empty() {
+            parts.push("рублей".to_string());
+        }
+        parts.join(" ")
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Gender { Masculine, Feminine }
+
+    fn three_digit_words(n: i64, gender: Gender) -> String {
+        let n = n as u32;
+        let mut out: Vec<&'static str> = Vec::new();
+        let hundreds = n / 100;
+        let tens = (n % 100) / 10;
+        let ones = n % 10;
+        if hundreds > 0 { out.push(HUNDREDS[hundreds as usize]); }
+        if tens == 1 {
+            out.push(TENS_TEENS[ones as usize]);
+        } else {
+            if tens > 0 { out.push(TENS[tens as usize]); }
+            if ones > 0 {
+                if gender == Gender::Feminine {
+                    out.push(ONES_FEM[ones as usize]);
+                } else {
+                    out.push(ONES_MASC[ones as usize]);
+                }
+            }
+        }
+        out.join(" ")
+    }
+
+    const HUNDREDS: [&str; 10] = [
+        "", "сто", "двести", "триста", "четыреста", "пятьсот", "шестьсот",
+        "семьсот", "восемьсот", "девятьсот",
+    ];
+    const TENS: [&str; 10] = [
+        "", "", "двадцать", "тридцать", "сорок", "пятьдесят", "шестьдесят",
+        "семьдесят", "восемьдесят", "девяносто",
+    ];
+    const TENS_TEENS: [&str; 10] = [
+        "десять", "одиннадцать", "двенадцать", "тринадцать", "четырнадцать",
+        "пятнадцать", "шестнадцать", "семнадцать", "восемнадцать", "девятнадцать",
+    ];
+    const ONES_MASC: [&str; 10] = [
+        "", "один", "два", "три", "четыре", "пять", "шесть", "семь", "восемь", "девять",
+    ];
+    const ONES_FEM: [&str; 10] = [
+        "", "одна", "две", "три", "четыре", "пять", "шесть", "семь", "восемь", "девять",
+    ];
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn words(v: f64) -> String { amount_to_words(v) }
+
+        #[test]
+        fn zero() { assert_eq!(words(0.0), "0 рублей 00 копеек"); }
+        #[test]
+        fn one_ruble() { assert_eq!(words(1.0), "Один рубль 00 копеек"); }
+        #[test]
+        fn two_rubles() { assert_eq!(words(2.0), "Два рубля 00 копеек"); }
+        #[test]
+        fn five_rubles() { assert_eq!(words(5.0), "Пять рублей 00 копеек"); }
+        #[test]
+        fn eleven_rubles() { assert_eq!(words(11.0), "Одиннадцать рублей 00 копеек"); }
+        #[test]
+        fn twenty_one_ruble() { assert_eq!(words(21.0), "Двадцать один рубль 00 копеек"); }
+        #[test]
+        fn twenty_two_rubles() { assert_eq!(words(22.0), "Двадцать два рубля 00 копеек"); }
+        #[test]
+        fn one_hundred() { assert_eq!(words(100.0), "Сто рублей 00 копеек"); }
+        #[test]
+        fn one_hundred_one() { assert_eq!(words(101.0), "Сто один рубль 00 копеек"); }
+        #[test]
+        fn one_thousand() { assert_eq!(words(1000.0), "Одна тысяча рублей 00 копеек"); }
+        #[test]
+        fn two_thousand() { assert_eq!(words(2000.0), "Две тысячи рублей 00 копеек"); }
+        #[test]
+        fn five_thousand() { assert_eq!(words(5000.0), "Пять тысяч рублей 00 копеек"); }
+        #[test]
+        fn twenty_one_thousand() { assert_eq!(words(21000.0), "Двадцать одна тысяча рублей 00 копеек"); }
+        #[test]
+        fn spec_reference_47100() {
+            assert_eq!(words(47100.0), "Сорок семь тысяч сто рублей 00 копеек");
+        }
+        #[test]
+        fn one_million() { assert_eq!(words(1_000_000.0), "Один миллион рублей 00 копеек"); }
+        #[test]
+        fn two_million() { assert_eq!(words(2_000_000.0), "Два миллиона рублей 00 копеек"); }
+        #[test]
+        fn test_case_12400() {
+            assert_eq!(words(12400.0), "Двенадцать тысяч четыреста рублей 00 копеек");
+        }
+        #[test]
+        fn kopecks_variants() {
+            assert_eq!(words(1.01), "Один рубль 01 копейка");
+            assert_eq!(words(1.02), "Один рубль 02 копейки");
+            assert_eq!(words(1.05), "Один рубль 05 копеек");
+            assert_eq!(words(1.11), "Один рубль 11 копеек");
+            assert_eq!(words(1.21), "Один рубль 21 копейка");
+        }
+        #[test]
+        fn capitalization_first_letter() {
+            let s = words(12400.0);
+            assert!(s.starts_with('Д'));
+        }
+        #[test]
+        fn complex_with_kopecks() {
+            assert_eq!(words(12345.67), "Двенадцать тысяч триста сорок пять рублей 67 копеек");
+        }
+        #[test]
+        fn declension_edge_12_13_14() {
+            assert!(words(12.0).contains("рублей"));
+            assert!(words(13.0).contains("рублей"));
+            assert!(words(14.0).contains("рублей"));
+            assert!(words(112.0).contains("рублей"));
+            assert!(words(1012.0).contains("рублей"));
+        }
+        #[test]
+        fn declension_edge_thousands_12_14() {
+            assert!(words(12000.0).contains("тысяч"));
+            assert!(words(13000.0).contains("тысяч"));
+            assert!(words(14000.0).contains("тысяч"));
+            assert!(words(21000.0).contains("тысяча"));
+            assert!(words(22000.0).contains("тысячи"));
+            assert!(words(25000.0).contains("тысяч"));
+        }
+    }
+}
+
+// ============================================================================
+// МОДУЛЬ model — структуры данных
+// ============================================================================
+
+/// Модель данных заявки: структуры, расчёт итогов.
+pub mod model {
+    use crate::fmt;
+    use serde::{Deserialize, Serialize};
+    use std::hash::Hash;
+
+    /// Единицы измерения.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    pub enum Unit {
+        /// «шт».
+        Sht,
+        /// «к-кт».
+        Kkt,
+    }
+
+    impl Unit {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Unit::Sht => "шт",
+                Unit::Kkt => "к-кт",
+            }
+        }
+        pub fn all() -> &'static [Unit] {
+            &[Unit::Sht, Unit::Kkt]
+        }
+    }
+
+    /// Одна строка таблицы товаров.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct LineItem {
+        pub name: String,
+        pub qty: String,
+        pub unit: Unit,
+        pub price: String,
+    }
+
+    impl LineItem {
+        pub fn empty() -> Self {
+            Self {
+                name: String::new(),
+                qty: String::new(),
+                unit: Unit::Sht,
+                price: String::new(),
+            }
+        }
+        pub fn qty_value(&self) -> Option<f64> { fmt::parse_number(&self.qty) }
+        pub fn price_value(&self) -> Option<f64> { fmt::parse_number(&self.price) }
+        pub fn sum_value(&self) -> Option<f64> {
+            Some(self.qty_value()? * self.price_value()?)
+        }
+        pub fn is_filled(&self) -> bool {
+            let name_ok = !self.name.trim().is_empty();
+            let qty_ok = self.qty_value().map(|v| v != 0.0).unwrap_or(false);
+            let price_ok = self.price_value().is_some();
+            name_ok && qty_ok && price_ok
+        }
+    }
+
+    /// Документ заявки.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct Document {
+        pub number: String,
+        pub date: String,
+        pub lines: Vec<LineItem>,
+    }
+
+    impl Document {
+        pub fn filled_lines(&self) -> Vec<&LineItem> {
+            self.lines.iter().filter(|l| l.is_filled()).collect()
+        }
+        pub fn filled_count(&self) -> usize {
+            self.lines.iter().filter(|l| l.is_filled()).count()
+        }
+        pub fn total(&self) -> f64 {
+            self.lines
+                .iter()
+                .filter_map(|l| if l.is_filled() { l.sum_value() } else { None })
+                .sum()
+        }
+    }
+
+    pub const SUPPLIER_NAME: &str = "Индивидуальный предприниматель Сюксина Мария Владимировна";
+    pub const SUPPLIER_INN: &str = "663004224114";
+    pub const NUMBER_PREFIX: &str = "DZHOД";
+
+    /// Генерирует номер: `DZHOД` + 6 случайных цифр.
+    pub fn generate_number() -> String {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let n: u32 = rng.gen_range(0..1_000_000);
+        format!("{}{:06}", NUMBER_PREFIX, n)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn line(name: &str, qty: &str, unit: Unit, price: &str) -> LineItem {
+            LineItem {
+                name: name.to_string(),
+                qty: qty.to_string(),
+                unit,
+                price: price.to_string(),
+            }
+        }
+
+        #[test]
+        fn line_sum_basic() {
+            let l = line("Товар", "2", Unit::Sht, "100");
+            assert_eq!(l.sum_value(), Some(200.0));
+        }
+        #[test]
+        fn line_sum_with_comma() {
+            let l = line("Товар", "1,5", Unit::Sht, "100");
+            assert_eq!(l.sum_value(), Some(150.0));
+        }
+        #[test]
+        fn line_filled_detection() {
+            assert!(line("A", "1", Unit::Sht, "10").is_filled());
+            assert!(!line("", "1", Unit::Sht, "10").is_filled());
+            assert!(!line("A", "", Unit::Sht, "10").is_filled());
+            assert!(!line("A", "1", Unit::Sht, "").is_filled());
+            assert!(!line("A", "0", Unit::Sht, "10").is_filled());
+        }
+        #[test]
+        fn total_skips_empty_lines() {
+            let doc = Document {
+                number: "DZHOД000001".to_string(),
+                date: "1 января 2026 г.".to_string(),
+                lines: vec![
+                    line("A", "1", Unit::Sht, "100"),
+                    LineItem::empty(),
+                    line("B", "2", Unit::Kkt, "50"),
+                    line("", "5", Unit::Sht, "10"),
+                ],
+            };
+            assert_eq!(doc.total(), 200.0);
+            assert_eq!(doc.filled_count(), 2);
+        }
+        #[test]
+        fn test_case_from_spec() {
+            let doc = Document {
+                number: "DZHOД000001".to_string(),
+                date: "1 января 2026 г.".to_string(),
+                lines: vec![
+                    line("Поршнекомплект с кольцами G4FA +0.5", "1", Unit::Kkt, "9100"),
+                    line("Антифриз, Korea-Standard зелёный -37°C, 5кг", "1", Unit::Sht, "1780"),
+                    line("HYUNDAI/KIA/MOBIS Клапан выпускной", "8", Unit::Sht, "190"),
+                ],
+            };
+            assert_eq!(doc.filled_count(), 3);
+            assert_eq!(doc.total(), 12400.0);
+        }
+        #[test]
+        fn number_format() {
+            let n = generate_number();
+            assert!(n.starts_with("DZHOД"));
+            assert_eq!(n.chars().count(), 11);
+            let digits: String = n.chars().skip_while(|c| !c.is_ascii_digit()).collect();
+            assert_eq!(digits.len(), 6);
+            assert!(digits.chars().all(|c| c.is_ascii_digit()));
+        }
+        #[test]
+        fn unit_strings() {
+            assert_eq!(Unit::Sht.as_str(), "шт");
+            assert_eq!(Unit::Kkt.as_str(), "к-кт");
+        }
+    }
+}
+
+// ============================================================================
+// МОДУЛЬ pdf — генерация PDF через genpdf
+// ============================================================================
+
+/// Модуль генерации PDF-документа.
+///
+/// Использует крейт `genpdf` со встроенным шрифтом PT Serif (SIL OFL 1.1)
+/// через `include_bytes!`. Файлы шрифта автоматически скачиваются
+/// при первой сборке через `build.rs`.
+pub mod pdf {
+    use crate::fmt;
+    use crate::model::{self, Document};
+    use crate::money_words;
+    use genpdf::style::Style;
+    use genpdf::Element;
+    use genpdf::{elements as el, Alignment, Document as GenDocument, Margins};
+    use std::path::Path;
+
+    // Шрифты вшиты в бинарник на этапе компиляции.
+    const FONT_REGULAR: &[u8] = include_bytes!("../assets/fonts/pt-serif-regular.ttf");
+    const FONT_BOLD: &[u8] = include_bytes!("../assets/fonts/pt-serif-bold.ttf");
+
+    const FONT_SIZE_BODY: u8 = 10;
+    const FONT_SIZE_TITLE: u8 = 13;
+    const FONT_SIZE_SMALL: u8 = 7;
+
+    /// Генерирует PDF и сохраняет его по указанному пути.
+    pub fn generate_pdf(doc: &Document, path: &Path) -> Result<(), String> {
+        let font_family = load_font_family()
+            .map_err(|e| format!("Не удалось загрузить шрифт: {}", e))?;
+
+        let mut pdf = GenDocument::new(font_family);
+        pdf.set_title(format!("Заявка на отгрузку № {}", doc.number));
+        pdf.set_font_size(FONT_SIZE_BODY);
+        // Воздушный межстрочный интервал — текст выглядит легче.
+        pdf.set_line_spacing(1.35);
+        pdf.set_paper_size(genpdf::PaperSize::A4);
+
+        let mut decorator = genpdf::SimplePageDecorator::new();
+        decorator.set_margins(Margins::trbl(
+            13.0_f32, 15.0_f32, 12.0_f32, 15.0_f32,
+        ));
+        pdf.set_page_decorator(decorator);
+
+        pdf.push(render_title(&doc.number, &doc.date));
+        pdf.push(render_supplier_block());
+        pdf.push(render_table(doc));
+        pdf.push(render_total_count(doc));
+        pdf.push(render_amount_in_words(doc));
+        pdf.push(render_payment_block(doc));
+        pdf.push(render_cashier_block());
+
+        pdf.render_to_file(path).map_err(|e| format!("Ошибка записи PDF: {}", e))?;
+        Ok(())
+    }
+
+    fn load_font_family() -> Result<genpdf::fonts::FontFamily<genpdf::fonts::FontData>, genpdf::error::Error> {
+        let regular = genpdf::fonts::FontData::new(FONT_REGULAR.to_vec(), None)?;
+        let bold = genpdf::fonts::FontData::new(FONT_BOLD.to_vec(), None)?;
+        let regular_italic = regular.clone();
+        let bold_italic = bold.clone();
+        Ok(genpdf::fonts::FontFamily {
+            regular, bold,
+            italic: regular_italic,
+            bold_italic,
+        })
+    }
+
+    fn render_title(number: &str, date: &str) -> el::LinearLayout {
+        let mut layout = el::LinearLayout::vertical();
+        let title = format!("Заявка на отгрузку № {} от {}", number, date);
+        // Заголовок — обычный шрифт увеличенного размера, без bold.
+        // Так выглядит изящнее и «дороже», чем жирный.
+        layout.push(
+            el::Paragraph::new(title)
+                .aligned(Alignment::Center)
+                .styled(Style::new().with_font_size(FONT_SIZE_TITLE)),
+        );
+        layout.push(el::Break::new(0.3));
+        layout.push(thin_line());
+        layout.push(el::Break::new(0.4));
+        layout
+    }
+
+    fn render_supplier_block() -> el::LinearLayout {
+        let mut layout = el::LinearLayout::vertical();
+        // «Поставщик:» и «ИНН:» — обычный шрифт, без bold.
+        // Bold оставляем только для самих значений — это создаёт
+        // лёгкий визуальный акцент без перегрузки.
+        let supplier_para = el::Paragraph::default()
+            .string("Поставщик:  ")
+            .styled_string(model::SUPPLIER_NAME, Style::new().bold());
+        layout.push(supplier_para);
+        let inn_para = el::Paragraph::default()
+            .string("ИНН:  ")
+            .styled_string(model::SUPPLIER_INN, Style::new().bold());
+        layout.push(inn_para);
+        layout.push(el::Break::new(0.3));
+        layout
+    }
+
+    fn render_table(doc: &Document) -> el::LinearLayout {
+        let mut layout = el::LinearLayout::vertical();
+        let frame = el::FrameCellDecorator::new(true, true, true);
+        let mut table = el::TableLayout::new(vec![1, 5, 1, 1, 1, 1]);
+        table.set_cell_decorator(frame);
+
+        let header_style = Style::new().bold();
+        let header: Vec<Box<dyn Element>> = vec![
+            Box::new(styled_paragraph("#", header_style, Alignment::Center)),
+            Box::new(styled_paragraph("Товар", header_style, Alignment::Left)),
+            Box::new(styled_paragraph("кол-во", header_style, Alignment::Center)),
+            Box::new(styled_paragraph("ед.", header_style, Alignment::Center)),
+            Box::new(styled_paragraph("цена", header_style, Alignment::Center)),
+            Box::new(styled_paragraph("сумма", header_style, Alignment::Center)),
+        ];
+        let _ = table.push_row(header);
+
+        let mut idx = 1u32;
+        for line in doc.filled_lines() {
+            let sum = line.sum_value().unwrap_or(0.0);
+            let qty_str = format_qty(line.qty_value());
+            let price_str = format_price(line.price_value());
+            let sum_str = fmt::format_money(sum);
+
+            let row: Vec<Box<dyn Element>> = vec![
+                Box::new(styled_paragraph(&idx.to_string(), Style::new(), Alignment::Center)),
+                Box::new(styled_paragraph(&line.name, Style::new(), Alignment::Left)),
+                Box::new(styled_paragraph(&qty_str, Style::new(), Alignment::Center)),
+                Box::new(styled_paragraph(line.unit.as_str(), Style::new(), Alignment::Center)),
+                Box::new(styled_paragraph(&price_str, Style::new(), Alignment::Right)),
+                Box::new(styled_paragraph(&sum_str, Style::new(), Alignment::Right)),
+            ];
+            let _ = table.push_row(row);
+            idx += 1;
+        }
+
+        let total = doc.total();
+        let total_str = fmt::format_money(total);
+        let bold = Style::new().bold();
+        let total_row: Vec<Box<dyn Element>> = vec![
+            Box::new(styled_paragraph("", bold, Alignment::Center)),
+            Box::new(styled_paragraph("", bold, Alignment::Left)),
+            Box::new(styled_paragraph("", bold, Alignment::Center)),
+            Box::new(styled_paragraph("Итого:", bold, Alignment::Right)),
+            Box::new(styled_paragraph("", bold, Alignment::Right)),
+            Box::new(styled_paragraph(&total_str, bold, Alignment::Right)),
+        ];
+        let _ = table.push_row(total_row);
+
+        layout.push(table);
+        layout.push(el::Break::new(0.4));
+        layout
+    }
+
+    fn render_total_count(doc: &Document) -> el::LinearLayout {
+        let mut layout = el::LinearLayout::vertical();
+        let n = doc.filled_count();
+        let x = fmt::format_rubles_rounded(doc.total());
+        let text = format!("Всего наименований {}, на сумму {} руб.", n, x);
+        layout.push(el::Paragraph::new(text));
+        layout.push(el::Break::new(0.3));
+        layout
+    }
+
+    fn render_amount_in_words(doc: &Document) -> el::LinearLayout {
+        let mut layout = el::LinearLayout::vertical();
+        let words = money_words::amount_to_words(doc.total());
+        layout.push(el::Paragraph::new(words).styled(Style::new().bold()));
+        layout.push(el::Break::new(0.4));
+        layout
+    }
+
+    fn render_payment_block(doc: &Document) -> el::LinearLayout {
+        let mut layout = el::LinearLayout::vertical();
+        layout.push(thin_line());
+        layout.push(el::Break::new(0.3));
+        // «Оплата» — обычный шрифт, не bold. Раньше жирный перегружал вид.
+        layout.push(el::Paragraph::new("Оплата"));
+        let cash_str = fmt::format_money(doc.total());
+        layout.push(el::Paragraph::new(format!("    Наличные {}", cash_str)));
+        layout.push(el::Paragraph::new("    Сдача  0,00"));
+        layout.push(el::Break::new(0.2));
+        layout.push(thin_line());
+        layout
+    }
+
+    fn render_cashier_block() -> el::LinearLayout {
+        let mut layout = el::LinearLayout::vertical();
+        layout.push(el::Break::new(0.5));
+        layout.push(el::Paragraph::new("Кассир:  __________________________________"));
+        layout.push(
+            el::Paragraph::new("                                                  (подпись)")
+                .styled(Style::new().with_font_size(FONT_SIZE_SMALL)),
+        );
+        layout
+    }
+
+    /// Тонкая горизонтальная линия на всю ширину.
+    ///
+    /// Реализация через таблицу 1×1 с FrameCellDecorator — рамка рисует
+    /// верхнюю и нижнюю линии. Без bold-стиля линия получается тонкой
+    /// и элегантной, не перегружает документ.
+    fn thin_line() -> impl Element {
+        let frame = el::FrameCellDecorator::new(true, true, true);
+        let mut table = el::TableLayout::new(vec![1]);
+        table.set_cell_decorator(frame);
+        let cell: Vec<Box<dyn Element>> = vec![Box::new(el::Break::new(0.02))];
+        let _ = table.push_row(cell);
+        el::StyledElement::new(table, Style::new())
+    }
+
+    fn styled_paragraph(text: &str, style: Style, align: Alignment) -> el::StyledElement<el::Paragraph> {
+        el::Paragraph::new(text).aligned(align).styled(style)
+    }
+
+    fn format_qty(value: Option<f64>) -> String {
+        match value {
+            Some(v) => {
+                if v.fract().abs() < 1e-9 {
+                    format!("{}", v as i64)
+                } else {
+                    format!("{:.3}", v).replace('.', ",")
+                }
+            }
+            None => String::new(),
+        }
+    }
+
+    fn format_price(value: Option<f64>) -> String {
+        match value {
+            Some(v) => fmt::format_money(v),
+            None => String::new(),
+        }
+    }
+}
+
+// ============================================================================
+// МОДУЛЬ gui — графический интерфейс на egui
+// ============================================================================
+
+/// Модуль графического интерфейса на egui.
+pub mod gui {
+    use crate::fmt;
+    use crate::model::{self, Document, LineItem, Unit};
+    use crate::pdf;
+    use crate::APP_NAME;
+    use eframe::egui;
+    use std::path::PathBuf;
+
+    /// Размер окна по умолчанию.
+    pub const WINDOW_WIDTH: f32 = 950.0;
+    pub const WINDOW_HEIGHT: f32 = 720.0;
+
+    /// Состояние приложения.
+    pub struct App {
+        pub doc: Document,
+        pub draft_path: PathBuf,
+        pub pdf_dir: PathBuf,
+        pub status_message: String,
+        pub last_filled_signature: u64,
+        pub show_new_doc_dialog: bool,
+    }
+
+    impl App {
+        pub fn new(draft_path: PathBuf, pdf_dir: PathBuf) -> Self {
+            let mut doc = load_draft(&draft_path).unwrap_or_else(|| Document {
+                number: model::generate_number(),
+                date: fmt::today_string(),
+                lines: vec![LineItem::empty()],
+            });
+            if doc.lines.is_empty() {
+                doc.lines.push(LineItem::empty());
+            }
+            doc.number = model::generate_number();
+            doc.date = fmt::today_string();
+
+            let last_filled_signature = filled_signature(&doc);
+            Self {
+                doc,
+                draft_path,
+                pdf_dir,
+                status_message: String::new(),
+                last_filled_signature,
+                show_new_doc_dialog: false,
+            }
+        }
+
+        pub fn save_draft(&self) {
+            if let Some(parent) = self.draft_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let json = serde_json::to_string_pretty(&self.doc).unwrap_or_default();
+            if let Err(e) = std::fs::write(&self.draft_path, json) {
+                eprintln!("Не удалось сохранить черновик: {}", e);
+            }
+        }
+
+        fn new_document(&mut self) {
+            self.doc = Document {
+                number: model::generate_number(),
+                date: fmt::today_string(),
+                lines: vec![LineItem::empty()],
+            };
+            self.last_filled_signature = 0;
+            self.status_message = "Создана новая заявка".to_string();
+            self.save_draft();
+        }
+
+        fn generate_and_open_pdf(&mut self) {
+            if self.doc.filled_count() == 0 {
+                self.status_message = "Нет заполненных строк для формирования PDF".to_string();
+                return;
+            }
+            let _ = std::fs::create_dir_all(&self.pdf_dir);
+            let filename = format!("Заявка {}.pdf", self.doc.number);
+            let path = self.pdf_dir.join(&filename);
+
+            match pdf::generate_pdf(&self.doc, &path) {
+                Ok(()) => {
+                    self.status_message = format!("PDF сохранён: {}", path.display());
+                    if let Err(e) = open::that(&path) {
+                        self.status_message = format!(
+                            "PDF создан, но не удалось открыть просмотрщик: {}", e
+                        );
+                    }
+                }
+                Err(e) => {
+                    self.status_message = format!("Ошибка генерации PDF: {}", e);
+                }
+            }
+        }
+
+        fn add_empty_line(&mut self) {
+            self.doc.lines.push(LineItem::empty());
+        }
+
+        fn remove_line(&mut self, idx: usize) {
+            if idx < self.doc.lines.len() {
+                self.doc.lines.remove(idx);
+                if self.doc.lines.is_empty() {
+                    self.doc.lines.push(LineItem::empty());
+                }
+            }
+        }
+
+        fn ensure_trailing_empty(&mut self) {
+            if let Some(last) = self.doc.lines.last() {
+                if last.is_filled() {
+                    self.doc.lines.push(LineItem::empty());
+                }
+            } else {
+                self.doc.lines.push(LineItem::empty());
+            }
+        }
+    }
+
+    impl eframe::App for App {
+        fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+            self.save_draft();
+        }
+
+        fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+            let title = format!("Заявка на отгрузку № {} — {}", self.doc.number, APP_NAME);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+
+            if self.show_new_doc_dialog {
+                let mut open = true;
+                egui::Window::new("Новая заявка")
+                    .collapsible(false)
+                    .resizable(false)
+                    .open(&mut open)
+                    .show(ctx, |ui| {
+                        ui.label("Очистить таблицу и сгенерировать новый номер заявки?");
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Да, создать новую").clicked() {
+                                self.new_document();
+                                self.show_new_doc_dialog = false;
+                            }
+                            if ui.button("Отмена").clicked() {
+                                self.show_new_doc_dialog = false;
+                            }
+                        });
+                    });
+                if !open {
+                    self.show_new_doc_dialog = false;
+                }
+            }
+
+            egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
+                ui.add_space(2.0);
+                ui.horizontal(|ui| { ui.label(&self.status_message); });
+                ui.add_space(2.0);
+            });
+
+            egui::TopBottomPanel::bottom("totals_panel")
+                .resizable(false)
+                .show(ctx, |ui| { self.render_totals(ui); });
+
+            egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Сформировать PDF").clicked() {
+                        self.generate_and_open_pdf();
+                    }
+                    if ui.button("Новая заявка").clicked() {
+                        self.show_new_doc_dialog = true;
+                    }
+                    ui.separator();
+                    if ui.button("+ Добавить строку").clicked() {
+                        self.add_empty_line();
+                    }
+                });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.heading(format!(
+                        "Заявка на отгрузку № {} от {}",
+                        self.doc.number, self.doc.date
+                    ));
+                });
+                ui.add_space(4.0);
+            });
+
+            egui::CentralPanel::default().show(ctx, |ui| {
+                self.render_table(ui);
+            });
+
+            self.ensure_trailing_empty();
+
+            let cur_sig = filled_signature(&self.doc);
+            if cur_sig != self.last_filled_signature {
+                self.last_filled_signature = cur_sig;
+                self.save_draft();
+            }
+        }
+    }
+
+    impl App {
+        fn render_table(&mut self, ui: &mut egui::Ui) {
+            let avail = ui.available_width();
+            let col_widths = [
+                avail * 0.04, avail * 0.42, avail * 0.10, avail * 0.09,
+                avail * 0.12, avail * 0.14, avail * 0.05,
+            ];
+
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let headers = ["№", "Товар", "кол-во", "ед.", "цена", "сумма", ""];
+                    let mut widths = col_widths.iter().copied();
+                    for h in headers.iter() {
+                        let w = widths.next().unwrap_or(60.0);
+                        let rich = egui::RichText::new(*h).strong();
+                        ui.add_sized([w, 18.0], egui::Label::new(rich));
+                    }
+                });
+                ui.separator();
+
+                let mut remove_idx: Option<usize> = None;
+                let line_count = self.doc.lines.len();
+                for i in 0..line_count {
+                    let line = &mut self.doc.lines[i];
+                    let mut widths = col_widths.iter().copied();
+                    ui.horizontal(|ui| {
+                        let w = widths.next().unwrap_or(40.0);
+                        ui.add_sized([w, 20.0], egui::Label::new(format!("{}", i + 1)));
+
+                        let w = widths.next().unwrap_or(200.0);
+                        ui.add_sized(
+                            [w, 20.0],
+                            egui::TextEdit::singleline(&mut line.name)
+                                .desired_width(w)
+                                .hint_text("Наименование товара"),
+                        );
+
+                        let w = widths.next().unwrap_or(60.0);
+                        ui.add_sized(
+                            [w, 20.0],
+                            egui::TextEdit::singleline(&mut line.qty)
+                                .desired_width(w)
+                                .hint_text("0"),
+                        );
+
+                        let w = widths.next().unwrap_or(60.0);
+                        let mut unit = line.unit;
+                        let combo_resp = egui::ComboBox::from_id_salt(format!("unit_{}", i))
+                            .selected_text(unit.as_str())
+                            .width(w)
+                            .show_ui(ui, |ui| {
+                                for u in Unit::all() {
+                                    ui.selectable_value(&mut unit, *u, u.as_str());
+                                }
+                            });
+                        line.unit = unit;
+                        let _ = combo_resp;
+
+                        let w = widths.next().unwrap_or(80.0);
+                        ui.add_sized(
+                            [w, 20.0],
+                            egui::TextEdit::singleline(&mut line.price)
+                                .desired_width(w)
+                                .hint_text("0,00"),
+                        );
+
+                        let w = widths.next().unwrap_or(80.0);
+                        let sum_str = line
+                            .sum_value()
+                            .map(|v| fmt::format_money(v))
+                            .unwrap_or_default();
+                        ui.add_sized([w, 20.0], egui::Label::new(sum_str).selectable(false));
+
+                        let _w = widths.next().unwrap_or(40.0);
+                        if ui.button("×").on_hover_text("Удалить строку").clicked() {
+                            remove_idx = Some(i);
+                        }
+                    });
+                    ui.separator();
+                }
+                if let Some(i) = remove_idx {
+                    self.remove_line(i);
+                }
+            });
+        }
+
+        fn render_totals(&self, ui: &mut egui::Ui) {
+            ui.add_space(4.0);
+            let total = self.doc.total();
+            let n = self.doc.filled_count();
+            let x = fmt::format_rubles_rounded(total);
+            let words = crate::money_words::amount_to_words(total);
+            let cash = fmt::format_money(total);
+
+            egui::Grid::new("totals_grid")
+                .num_columns(2)
+                .striped(false)
+                .min_col_width(140.0)
+                .show(ui, |ui| {
+                    ui.strong("Итого:");
+                    ui.label(fmt::format_money(total));
+                    ui.end_row();
+
+                    ui.strong("Всего наименований:");
+                    ui.label(format!("{}, на сумму {} руб.", n, x));
+                    ui.end_row();
+
+                    ui.strong("Сумма прописью:");
+                    ui.label(words);
+                    ui.end_row();
+
+                    ui.strong("Оплата / Наличные:");
+                    ui.label(cash);
+                    ui.end_row();
+
+                    ui.strong("Сдача:");
+                    ui.label("0,00");
+                    ui.end_row();
+                });
+            ui.add_space(4.0);
+        }
+    }
+
+    fn filled_signature(doc: &Document) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        for line in &doc.lines {
+            line.name.hash(&mut h);
+            line.qty.hash(&mut h);
+            line.unit.hash(&mut h);
+            line.price.hash(&mut h);
+        }
+        h.finish()
+    }
+
+    fn load_draft(path: &std::path::Path) -> Option<Document> {
+        let content = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str::<Document>(&content).ok()
+    }
+}
