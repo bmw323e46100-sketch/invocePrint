@@ -471,8 +471,7 @@ pub mod model {
         }
     }
 
-    pub const SUPPLIER_NAME: &str = "Индивидуальный предприниматель Сюксина Мария Владимировна";
-    pub const SUPPLIER_INN: &str = "663004224114";
+    pub const SUPPLIER_NAME: &str = "ООО «Автоконтракты»";
     pub const NUMBER_PREFIX: &str = "DZHOД";
 
     /// Генерирует номер: `DZHOД` + 6 случайных цифр.
@@ -579,8 +578,14 @@ pub mod pdf {
     use std::path::Path;
 
     // Шрифты вшиты в бинарник на этапе компиляции.
-    const FONT_REGULAR: &[u8] = include_bytes!("../assets/fonts/pt-serif-regular.ttf");
-    const FONT_BOLD: &[u8] = include_bytes!("../assets/fonts/pt-serif-bold.ttf");
+    // Noto Serif — самое широкое покрытие Unicode среди свободных шрифтов
+    // с засечками: латиница, кириллица (включая расширенную), греческий,
+    // все знаки препинания, цифры, специальные символы.
+    //
+    // Пути к шрифтам передаются через cargo:rustc-env из build.rs,
+    // который скачивает их в OUT_DIR (обходит sandbox Cargo).
+    const FONT_REGULAR: &[u8] = include_bytes!(env!("FONT_REGULAR_PATH"));
+    const FONT_BOLD: &[u8] = include_bytes!(env!("FONT_BOLD_PATH"));
 
     const FONT_SIZE_BODY: u8 = 10;
     const FONT_SIZE_TITLE: u8 = 13;
@@ -610,7 +615,7 @@ pub mod pdf {
         pdf.push(render_total_count(doc));
         pdf.push(render_amount_in_words(doc));
         pdf.push(render_payment_block(doc));
-        pdf.push(render_cashier_block());
+        pdf.push(render_signatures_block());
 
         pdf.render_to_file(path).map_err(|e| format!("Ошибка записи PDF: {}", e))?;
         Ok(())
@@ -646,17 +651,12 @@ pub mod pdf {
 
     fn render_supplier_block() -> el::LinearLayout {
         let mut layout = el::LinearLayout::vertical();
-        // «Поставщик:» и «ИНН:» — обычный шрифт, без bold.
-        // Bold оставляем только для самих значений — это создаёт
-        // лёгкий визуальный акцент без перегрузки.
+        // Поставщик — без ИНН (по новой спецификации). ИНН полностью убран.
+        // «Поставщик:» — обычный шрифт, значение — жирным для акцента.
         let supplier_para = el::Paragraph::default()
             .string("Поставщик:  ")
             .styled_string(model::SUPPLIER_NAME, Style::new().bold());
         layout.push(supplier_para);
-        let inn_para = el::Paragraph::default()
-            .string("ИНН:  ")
-            .styled_string(model::SUPPLIER_INN, Style::new().bold());
-        layout.push(inn_para);
         layout.push(el::Break::new(0.3));
         layout
     }
@@ -747,14 +747,43 @@ pub mod pdf {
         layout
     }
 
-    fn render_cashier_block() -> el::LinearLayout {
+    fn render_signatures_block() -> el::LinearLayout {
+        // Две графы для подписей: «Отпустил» и «Получил».
+        // Вместо прежнего блока «Кассир» — по новой спецификации.
         let mut layout = el::LinearLayout::vertical();
-        layout.push(el::Break::new(0.5));
-        layout.push(el::Paragraph::new("Кассир:  __________________________________"));
-        layout.push(
-            el::Paragraph::new("                                                  (подпись)")
-                .styled(Style::new().with_font_size(FONT_SIZE_SMALL)),
-        );
+        layout.push(el::Break::new(0.6));
+        // Две колонки 50/50 с линиями для подписи.
+        let frame = el::FrameCellDecorator::new(false, false, false);
+        let mut table = el::TableLayout::new(vec![1, 1]);
+        table.set_cell_decorator(frame);
+        let line_style = Style::new();
+        let row: Vec<Box<dyn Element>> = vec![
+            Box::new(
+                el::Paragraph::new("Отпустил: ______________________")
+                    .styled(line_style.clone()),
+            ),
+            Box::new(
+                el::Paragraph::new("Получил: ______________________")
+                    .aligned(Alignment::Right)
+                    .styled(line_style),
+            ),
+        ];
+        let _ = table.push_row(row);
+        layout.push(table);
+        // Подписи «(подпись)» под линиями.
+        let mut sub_table = el::TableLayout::new(vec![1, 1]);
+        sub_table.set_cell_decorator(el::FrameCellDecorator::new(false, false, false));
+        let small_style = Style::new().with_font_size(FONT_SIZE_SMALL);
+        let sub_row: Vec<Box<dyn Element>> = vec![
+            Box::new(el::Paragraph::new("              (подпись)").styled(small_style.clone())),
+            Box::new(
+                el::Paragraph::new("              (подпись)")
+                    .aligned(Alignment::Right)
+                    .styled(small_style),
+            ),
+        ];
+        let _ = sub_table.push_row(sub_row);
+        layout.push(sub_table);
         layout
     }
 

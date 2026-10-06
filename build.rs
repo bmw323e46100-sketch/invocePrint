@@ -1,53 +1,67 @@
 // build.rs
 //
-// Автоматически скачивает шрифты PT Serif (Regular + Bold) при первой
-// сборке, если их нет в assets/fonts/. Запускается cargo до компиляции.
+// Автоматически скачивает шрифты Noto Serif (Regular + Bold) при первой
+// сборке. Запускается cargo до компиляции.
 //
-// Источник: официальный репозиторий google/fonts на GitHub через CDN jsDelivr.
+// Источник: официальный репозиторий notofonts на GitHub через CDN jsDelivr.
 // Лицензия: SIL OFL 1.1 (разрешает встраивание и распространение).
-// PT Serif специально разработан ParaType для кириллицы — отлично подходит
-// для русскоязычных документов.
+//
+// Noto Serif выбран за самое широкое покрытие Unicode среди свободных
+// шрифтов с засечками: поддерживает латиницу, кириллицу (включая
+// расширенную), греческий, все знаки препинания, цифры, специальные
+// символы (|, /, -, кавычки «», №, и т.д.) — гарантированно отображает
+// любые символы, которые пользователь может ввести в наименовании товара.
+//
+// Шрифты сохраняются в OUT_DIR (официальное место для выходных данных
+// build script) — это обходит sandbox Cargo, который не позволяет
+// build script записывать файлы в произвольные места. Пути передаются
+// в lib.rs через cargo:rustc-env.
 
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
-const FONTS: &[(&str, &str)] = &[
+const FONTS: &[(&str, &str, &str)] = &[
     (
-        "pt-serif-regular.ttf",
-        "https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/ptserif/PT_Serif-Web-Regular.ttf",
+        "noto-serif-regular.ttf",
+        "https://cdn.jsdelivr.net/gh/notofonts/notofonts.github.io@main/fonts/NotoSerif/hinted/ttf/NotoSerif-Regular.ttf",
+        "FONT_REGULAR_PATH",
     ),
     (
-        "pt-serif-bold.ttf",
-        "https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/ptserif/PT_Serif-Web-Bold.ttf",
+        "noto-serif-bold.ttf",
+        "https://cdn.jsdelivr.net/gh/notofonts/notofonts.github.io@main/fonts/NotoSerif/hinted/ttf/NotoSerif-Bold.ttf",
+        "FONT_BOLD_PATH",
     ),
 ];
 
 fn main() {
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let fonts_dir = manifest_dir.join("assets").join("fonts");
-    std::fs::create_dir_all(&fonts_dir).expect("не удалось создать assets/fonts");
+    // OUT_DIR — официальный каталог для выходных данных build script.
+    // Cargo гарантированно позволяет сюда писать.
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
+    let fonts_dir = out_dir.join("fonts");
+    std::fs::create_dir_all(&fonts_dir).expect("не удалось создать fonts dir");
 
-    for (name, url) in FONTS {
+    for (name, url, env_var) in FONTS {
         let path = fonts_dir.join(name);
-        // Считаем файл валидным, если он больше 100 КБ.
         let already_ok = path.exists()
             && std::fs::metadata(&path).map(|m| m.len() > 100_000).unwrap_or(false);
-        if already_ok {
-            continue;
+        if !already_ok {
+            println!("cargo:warning=Скачиваю шрифт {} ...", name);
+            let ok = download(url, &path);
+            if !ok {
+                panic!(
+                    "Не удалось скачать шрифт {} с {}.\n\
+                     Скачайте вручную и положите в: {}",
+                    name, url, path.display()
+                );
+            }
+            println!("cargo:warning=Шрифт {} скачан ({} байт).",
+                name,
+                std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0));
         }
-        println!("cargo:warning=Скачиваю шрифт {} ...", name);
-        let ok = download(url, &path);
-        if !ok {
-            panic!(
-                "Не удалось скачать шрифт {} с {}.\n\
-                 Скачайте вручную и положите в assets/fonts/{}",
-                name, url, name
-            );
-        }
-        println!("cargo:warning=Шрифт {} скачан ({} байт).",
-            name,
-            std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0));
+        // Передаём абсолютный путь к шрифту в lib.rs через окружение.
+        // include_bytes!(env!("...")) использует этот путь при компиляции.
+        println!("cargo:rustc-env={}={}", env_var, path.display());
     }
 
     println!("cargo:rerun-if-changed=build.rs");
