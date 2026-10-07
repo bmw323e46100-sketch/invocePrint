@@ -1559,6 +1559,8 @@ pub mod gui {
         pub history_entries: Vec<HistoryEntry>,
         /// Индекс выбранной записи в истории (для просмотра деталей).
         pub history_selected: Option<usize>,
+        /// Флаг тёмной темы (true = тёмная, false = светлая).
+        pub dark_theme: bool,
     }
 
     impl App {
@@ -1586,6 +1588,22 @@ pub mod gui {
                 show_history_window: false,
                 history_entries: Vec::new(),
                 history_selected: None,
+                dark_theme: false,
+            }
+        }
+
+        /// Переключает между тёмной и светлой темой.
+        pub fn toggle_theme(&mut self, ctx: &egui::Context) {
+            self.dark_theme = !self.dark_theme;
+            self.apply_theme(ctx);
+        }
+
+        /// Применяет текущую тему к egui-контексту.
+        pub fn apply_theme(&self, ctx: &egui::Context) {
+            if self.dark_theme {
+                ctx.set_visuals(egui::Visuals::dark());
+            } else {
+                ctx.set_visuals(egui::Visuals::light());
             }
         }
 
@@ -1664,40 +1682,6 @@ pub mod gui {
             }
         }
 
-        /// Открывает файловый диалог и импортирует CSV из выбранного файла.
-        /// Импортированные строки ДОБАВЛЯЮТСЯ к текущим (не заменяют).
-        fn import_csv_from_file(&mut self) {
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter("CSV файлы", &["csv", "txt"])
-                .add_filter("Все файлы", &["*"])
-                .set_title("Выберите CSV-файл от поставщика")
-                .pick_file()
-            {
-                match crate::csv_import::parse_csv_file(&path) {
-                    Ok(result) => {
-                        // Добавляем импортированные строки к существующим.
-                        // Сначала удаляем пустые строки в конце.
-                        while let Some(last) = self.doc.lines.last() {
-                            if !last.is_filled() {
-                                self.doc.lines.pop();
-                            } else {
-                                break;
-                            }
-                        }
-                        self.doc.lines.extend(result.items);
-                        // Гарантируем хотя бы одну пустую строку в конце.
-                        if self.doc.lines.is_empty() {
-                            self.doc.lines.push(LineItem::empty());
-                        }
-                        self.status_message = result.message;
-                    }
-                    Err(e) => {
-                        self.status_message = format!("Ошибка импорта: {}", e);
-                    }
-                }
-            }
-        }
-
         /// Читает CSV из буфера обмена и импортирует строки.
         fn import_csv_from_clipboard(&mut self, _ctx: &egui::Context) {
             // Используем arboard для чтения буфера обмена — egui 0.29
@@ -1740,7 +1724,8 @@ pub mod gui {
         }
 
         /// Копирует текст заявки в буфер обмена — для отправки в Telegram,
-        /// мессенджеры или email. Формат: читаемый текст с переносами строк.
+        /// мессенджеры или email. Формат: только список товаров + итоги
+        /// (без шапки с номером заявки и поставщиком — по запросу пользователя).
         fn copy_to_clipboard(&mut self, ctx: &egui::Context) {
             let total = self.doc.total();
             let total_str = fmt::format_money(total);
@@ -1749,15 +1734,8 @@ pub mod gui {
             let x = fmt::format_rubles_rounded(total);
 
             let mut text = String::new();
-            text.push_str(&format!(
-                "Заявка на отгрузку № {} от {}\n",
-                self.doc.number, self.doc.date
-            ));
-            text.push('\n');
-            text.push_str(&format!("Поставщик: {}\n", crate::model::SUPPLIER_NAME));
-            text.push('\n');
 
-            // Таблица в текстовом виде — просто пронумерованный список.
+            // Список товаров — без шапки, сразу нумерованный список.
             for (idx, line) in (1u32..).zip(self.doc.filled_lines()) {
                 let qty = line.qty_value().unwrap_or(0.0);
                 let price = line.price_value().unwrap_or(0.0);
@@ -1780,9 +1758,6 @@ pub mod gui {
                 n, x
             ));
             text.push_str(&format!("{}\n", total_words));
-            text.push('\n');
-            text.push_str(&format!("Оплата / Наличные {}\n", total_str));
-            text.push_str("Сдача 0,00\n");
 
             ctx.copy_text(text);
             self.status_message =
@@ -1807,6 +1782,9 @@ pub mod gui {
         }
 
         fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+            // Применяем тему каждый кадр — гарантирует, что тема не «слетит».
+            self.apply_theme(ui.ctx());
+
             let title = format!("Заявка на отгрузку № {} — {}", self.doc.number, APP_NAME);
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Title(title));
 
@@ -1837,7 +1815,7 @@ pub mod gui {
             // Окно истории распечаток.
             if self.show_history_window {
                 let mut open = true;
-                egui::Window::new("📋 История распечаток")
+                egui::Window::new("История распечаток")
                     .collapsible(false)
                     .resizable(true)
                     .default_width(900.0)
@@ -1875,23 +1853,27 @@ pub mod gui {
                         self.add_empty_line();
                     }
                     ui.separator();
-                    if ui.button("📥 Импорт CSV").clicked() {
-                        self.import_csv_from_file();
-                    }
-                    if ui.button("📋 Вставить из буфера").clicked() {
+                    // Импорт только из буфера обмена — без файлового диалога.
+                    if ui.button("Вставить из буфера").clicked() {
                         self.import_csv_from_clipboard(ui.ctx());
                     }
                     ui.separator();
-                    if ui.button("📑 Копировать текст").clicked() {
+                    if ui.button("Копировать текст").clicked() {
                         self.copy_to_clipboard(ui.ctx());
                     }
                     ui.separator();
-                    if ui.button("🗂 История").clicked() {
+                    // Кнопка истории — текст, не эмодзи (егui не рендерит эмодзи).
+                    if ui.button("История").clicked() {
                         // Обновляем кэш истории при открытии окна.
                         let store = HistoryStore::new(self.history_dir.clone());
                         self.history_entries = store.list();
                         self.history_selected = None;
                         self.show_history_window = true;
+                    }
+                    // Кнопка переключения темы (тёмная/светлая).
+                    let theme_label = if self.dark_theme { "Светлая тема" } else { "Тёмная тема" };
+                    if ui.button(theme_label).clicked() {
+                        self.toggle_theme(ui.ctx());
                     }
                 });
                 ui.add_space(4.0);
@@ -2049,12 +2031,12 @@ pub mod gui {
                     self.history_entries.len()
                 ));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("🔄 Обновить").clicked() {
+                    if ui.button("Обновить").clicked() {
                         let store = HistoryStore::new(self.history_dir.clone());
                         self.history_entries = store.list();
                         self.history_selected = None;
                     }
-                    if ui.button("📂 Открыть папку").clicked() {
+                    if ui.button("Открыть папку").clicked() {
                         let _ = open::that(&self.history_dir);
                     }
                 });
@@ -2175,11 +2157,11 @@ pub mod gui {
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             if let Some(pdf) = &entry_clone.pdf_path {
-                                if ui.button("📄 Открыть PDF").clicked() {
+                                if ui.button("Открыть PDF").clicked() {
                                     let _ = open::that(pdf);
                                 }
                             }
-                            if ui.button("🗑 Удалить из истории").clicked() {
+                            if ui.button("Удалить из истории").clicked() {
                                 let store = HistoryStore::new(self.history_dir.clone());
                                 match store.delete(&entry_clone.number, &entry_clone.timestamp) {
                                     Ok(()) => {
