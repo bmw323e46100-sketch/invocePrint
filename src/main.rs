@@ -21,8 +21,16 @@ fn main() -> eframe::Result<()> {
         .with_min_inner_size([640.0, 480.0])
         .with_title(format!("Заявка на отгрузку — {}", APP_NAME));
 
+    // Используем glow-рендер (OpenGL) вместо wgpu по умолчанию.
+    // Это избегает конфликта версий крейта `windows` (0.58 vs 0.62) в
+    // транзитивных зависимостях wgpu-hal на Windows, который приводит
+    // к ошибкам компиляции. Glow-рендер легче, стабильнее и совместим
+    // со всеми ОС (Windows 10/11, Linux, macOS).
+    let renderer = eframe::Renderer::Glow;
+
     let native_options = eframe::NativeOptions {
         viewport,
+        renderer,
         ..Default::default()
     };
 

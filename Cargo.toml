@@ -16,7 +16,7 @@ name = "zayavka"
 path = "src/main.rs"
 
 [dependencies]
-eframe = "0.36"
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 egui = "0.36"
 genpdf = "0.2"
 rand = "0.10"
