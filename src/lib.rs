@@ -869,6 +869,267 @@ pub mod history {
 }
 
 // ============================================================================
+// МОДУЛЬ csv_import — импорт заявок из CSV (формат поставщика)
+// ============================================================================
+
+/// Модуль импорта CSV-данных из выгрузки сайта поставщика.
+///
+/// Формат CSV (разделитель `;`):
+/// ```text
+/// GUID;Номер запчасти;Наименование;Бренд;Цена, руб;Заказано;Сумма, руб;Комментарий;Статус
+/// NSIN0003495651;MN110724;Сальник полуоси;Mitsubishi;324.91;1;324.91;;
+/// NSIN0005391098;MB664611;Подшипник полуоси| зад |;Mitsubishi;3 847.11;1;3 847.11;;
+/// ...
+/// Итого;;;;;6;12 191.76;;
+/// ```
+///
+/// При импорте:
+/// - Наименование товара формируется как «Наименование [Бренд] (Номер)» —
+///   так пользователь видит полную информацию.
+/// - Количество берётся из колонки «Заказано».
+/// - Цена — из «Цена, руб» (пробелы-разделители тысяч удаляются).
+/// - Служебная строка «Итого» пропускается.
+/// - Пустые строки (с нулевым количеством или без наименования) пропускаются.
+pub mod csv_import {
+    use crate::model::{LineItem, Unit};
+
+    /// Результат импорта: список строк + количество пропущенных.
+    #[derive(Debug, Clone)]
+    pub struct ImportResult {
+        /// Успешно импортированные строки.
+        pub items: Vec<LineItem>,
+        /// Количество пропущенных строк (заголовок, «Итого», пустые).
+        pub skipped: usize,
+        /// Сообщение для пользователя.
+        pub message: String,
+    }
+
+    /// Парсит CSV-текст и возвращает строки товаров.
+    ///
+    /// Принимает текст целиком (с заголовком, строками данных и финальной
+    /// строкой «Итого»). Разделитель — точка с запятой `;`.
+    /// Пробелы в числах (разделители тысяч) игнорируются.
+    pub fn parse_csv_text(text: &str) -> ImportResult {
+        let mut items = Vec::new();
+        let mut skipped = 0;
+        let mut header_seen = false;
+
+        for raw_line in text.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() {
+                skipped += 1;
+                continue;
+            }
+
+            // Пропускаем заголовок (содержит «GUID» или «Наименование»).
+            if !header_seen
+                && (line.contains("GUID") || line.contains("Номер запчасти"))
+            {
+                header_seen = true;
+                skipped += 1;
+                continue;
+            }
+
+            // Пропускаем строку «Итого».
+            if line.to_lowercase().starts_with("итого")
+                || line.starts_with("Итого")
+                || line.starts_with("ИТОГО")
+            {
+                skipped += 1;
+                continue;
+            }
+
+            // Разбиваем по `;`.
+            let cols: Vec<&str> = line.split(';').collect();
+            // Ожидаем минимум 7 колонок: GUID, Номер, Наименование, Бренд,
+            // Цена, Заказано, Сумма, ... (Комментарий и Статус могут быть пустыми).
+            if cols.len() < 7 {
+                skipped += 1;
+                continue;
+            }
+
+            let _guid = cols[0].trim();
+            let part_number = cols[1].trim();
+            let name = cols[2].trim();
+            let brand = cols[3].trim();
+            let price_str = cols[4].trim();
+            let qty_str = cols[5].trim();
+            let _sum_str = cols[6].trim();
+
+            // Пропускаем строки без наименования.
+            if name.is_empty() {
+                skipped += 1;
+                continue;
+            }
+
+            // Парсим количество (игнорируем пробелы).
+            let qty_clean: String = qty_str
+                .chars()
+                .filter(|c| !c.is_whitespace() && *c != '\u{a0}')
+                .collect();
+            let qty_val: f64 = match qty_clean.parse() {
+                Ok(v) => v,
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+            // Пропускаем строки с нулевым количеством.
+            if qty_val == 0.0 {
+                skipped += 1;
+                continue;
+            }
+
+            // Парсим цену (заменяем неразрывный пробел на обычный и удаляем
+            // все пробелы, потом парсим как f64 — поддерживает и точку, и запятую).
+            let price_clean: String = price_str
+                .chars()
+                .filter(|c| !c.is_whitespace() && *c != '\u{a0}')
+                .map(|c| if c == ',' { '.' } else { c })
+                .collect();
+            let price_val: f64 = match price_clean.parse() {
+                Ok(v) => v,
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+
+            // Формируем наименование товара: «Наименование [Бренд] (Номер)».
+            // Если бренд или номер пустые — не добавляем их.
+            let mut full_name = name.to_string();
+            if !brand.is_empty() {
+                full_name.push_str(&format!(" [{}]", brand));
+            }
+            if !part_number.is_empty() {
+                full_name.push_str(&format!(" ({})", part_number));
+            }
+
+            items.push(LineItem {
+                name: full_name,
+                qty: format!("{}", qty_val),
+                unit: Unit::Sht,
+                price: format!("{}", price_val),
+            });
+        }
+
+        let message = if items.is_empty() {
+            format!("Не найдено ни одной строки для импорта (пропущено: {})", skipped)
+        } else {
+            format!(
+                "Импортировано строк: {}, пропущено: {}",
+                items.len(),
+                skipped
+            )
+        };
+
+        ImportResult {
+            items,
+            skipped,
+            message,
+        }
+    }
+
+    /// Читает CSV-файл и парсит его.
+    pub fn parse_csv_file(path: &std::path::Path) -> Result<ImportResult, String> {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("Не удалось прочитать файл: {}", e))?;
+        Ok(parse_csv_text(&content))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        const SAMPLE_CSV: &str = "GUID;Номер запчасти;Наименование;Бренд;Цена, руб;Заказано;Сумма, руб;Комментарий;Статус
+NSIN0003495651;MN110724;Сальник полуоси;Mitsubishi;324.91;1;324.91;;
+NSIN0005391098;MB664611;Подшипник полуоси| зад |;Mitsubishi;3 847.11;1;3 847.11;;
+NSIN0005391136;MR111877;Втулка запорная с ABS ;Mitsubishi;2 997.98;1;2 997.98;;
+NSII0015501676;3715A155;Сальник подшипника задней полуоси;Mitsubishi;371.74;1;371.74;;
+NSIN0000087515;343251;Амортизатор - Excel-G | зад прав/лев |;KYB;2 325.01;2;4 650.02;;
+Итого;;;;;6;12 191.76;;";
+
+        #[test]
+        fn parse_full_csv() {
+            let result = parse_csv_text(SAMPLE_CSV);
+            assert_eq!(result.items.len(), 5);
+            // Заголовок + строка «Итого» = 2 пропущенных.
+            assert_eq!(result.skipped, 2);
+
+            // Проверяем первую строку.
+            let first = &result.items[0];
+            assert_eq!(first.name, "Сальник полуоси [Mitsubishi] (MN110724)");
+            assert_eq!(first.qty, "1");
+            assert_eq!(first.price, "324.91");
+
+            // Проверяем последнюю (с количеством 2).
+            let last = &result.items[4];
+            assert!(last.name.contains("Амортизатор"));
+            assert!(last.name.contains("KYB"));
+            assert!(last.name.contains("343251"));
+            assert_eq!(last.qty, "2");
+            assert_eq!(last.price, "2325.01");
+        }
+
+        #[test]
+        fn parse_handles_spaces_in_numbers() {
+            let csv = "GUID;Номер;Наименование;Бренд;Цена, руб;Заказано;Сумма, руб;;
+NSIN1;P1;Товар;Brand;1 999,50;3;5 998,50;;";
+            let result = parse_csv_text(csv);
+            assert_eq!(result.items.len(), 1);
+            // Цена с пробелом-разделителем и запятой должна распарситься.
+            assert_eq!(result.items[0].price, "1999.5");
+            assert_eq!(result.items[0].qty, "3");
+        }
+
+        #[test]
+        fn parse_skips_empty_and_zero_qty() {
+            let csv = "GUID;Номер;Наименование;Бренд;Цена, руб;Заказано;Сумма, руб;;
+NSIN1;P1;Товар1;B;100;1;100;;
+NSIN2;P2;;B;100;1;100;;
+NSIN3;P3;Товар3;B;100;0;0;;";
+            let result = parse_csv_text(csv);
+            assert_eq!(result.items.len(), 1);
+            assert_eq!(result.items[0].name, "Товар1 [B] (P1)");
+        }
+
+        #[test]
+        fn parse_handles_missing_brand_and_number() {
+            // Наименование пустое → строка пропускается.
+            let csv = "GUID;Номер;Наименование;Бренд;Цена, руб;Заказано;Сумма, руб;;
+NSIN1;;;500;1;500;;";
+            let result = parse_csv_text(csv);
+            assert_eq!(result.items.len(), 0);
+            assert!(result.skipped >= 1);
+        }
+
+        #[test]
+        fn parse_only_name_no_brand_no_number() {
+            // Только наименование, без бренда и номера — должна импортироваться.
+            let csv = "GUID;Номер;Наименование;Бренд;Цена, руб;Заказано;Сумма, руб;;
+NSIN1;;Товар;;;500;1;500;;";
+            // Если 8 колонок — то name=Товар, brand=пусто, number=пусто.
+            // Но "NSIN1;;Товар;;;500;1;500;;".split(';') = ["NSIN1", "", "Товар", "", "", "500", "1", "500", "", ""] — 10 колонок
+            // cols[4]=пусто (price), cols[5]=500 (qty), cols[6]=1 (sum) — цена пустая, пропустится.
+            // Чтобы тест был корректным, сделаем правильную расстановку.
+            let csv2 = "GUID;Номер;Наименование;Бренд;Цена, руб;Заказано;Сумма, руб;;
+NSIN1;;Товар;;500;1;500;;";
+            let result = parse_csv_text(csv2);
+            assert_eq!(result.items.len(), 1);
+            assert_eq!(result.items[0].name, "Товар");
+            assert_eq!(result.items[0].price, "500");
+        }
+
+        #[test]
+        fn parse_returns_message() {
+            let result = parse_csv_text(SAMPLE_CSV);
+            assert!(result.message.contains("5"));
+            assert!(result.message.contains("пропущено: 2"));
+        }
+    }
+}
+
+// ============================================================================
 // МОДУЛЬ pdf — генерация PDF через genpdf
 // ============================================================================
 
@@ -901,8 +1162,77 @@ pub mod pdf {
     const FONT_SIZE_TITLE: u8 = 13;
     const FONT_SIZE_SMALL: u8 = 7;
 
+    // ============================================================================
+    // Фильтрация неподдерживаемых символов
+    // ============================================================================
+
+    /// Thread-local кэш распарсенного шрифта. Face парсится один раз на поток,
+    /// потом используется для проверки отдельных символов через `glyph_index`.
+    /// `glyph_index` очень быстрый (O(log n) в cmap), поэтому фильтрация
+    /// строк не создаёт накладных расходов.
+    thread_local! {
+        static FONT_FACE: std::cell::RefCell<Option<ttf_parser::Face<'static>>> =
+            std::cell::RefCell::new(None);
+    }
+
+    /// Проверяет, поддерживает ли шрифт данный символ.
+    fn is_char_supported(c: char) -> bool {
+        // Управляющие символы всегда пропускаем.
+        if c == '\n' || c == '\r' || c == '\t' {
+            return true;
+        }
+        FONT_FACE.with(|cell| {
+            let mut borrowed = cell.borrow_mut();
+            if borrowed.is_none() {
+                *borrowed = ttf_parser::Face::parse(FONT_REGULAR, 0).ok();
+            }
+            if let Some(face) = borrowed.as_ref() {
+                face.glyph_index(c).is_some()
+            } else {
+                false
+            }
+        })
+    }
+
+    /// Фильтрует строку, удаляя символы, которых нет в шрифте.
+    /// Заменяет их пустой строкой (не вопросительным знаком — пользователь
+    /// явно просил исключить «пустые квадраты и знаки вопроса»).
+    pub fn filter_unsupported(text: &str) -> String {
+        text.chars()
+            .filter(|c| is_char_supported(*c))
+            .collect()
+    }
+
+    /// Применяет `filter_unsupported` к документу — возвращает новую копию
+    /// документа, в которой все строки очищены от неподдерживаемых символов.
+    fn filter_document(doc: &Document) -> Document {
+        use crate::model::LineItem;
+        let filtered_lines = doc
+            .lines
+            .iter()
+            .map(|line| LineItem {
+                name: filter_unsupported(&line.name),
+                qty: filter_unsupported(&line.qty),
+                unit: line.unit,
+                price: filter_unsupported(&line.price),
+            })
+            .collect();
+        Document {
+            number: filter_unsupported(&doc.number),
+            date: filter_unsupported(&doc.date),
+            lines: filtered_lines,
+        }
+    }
+
     /// Генерирует PDF и сохраняет его по указанному пути.
+    ///
+    /// Перед рендерингом **все строки документа фильтруются** — символы,
+    /// которых нет в шрифте DejaVu Serif, удаляются. Это исключает появление
+    /// пустых квадратов (tofu) и знаков вопроса в PDF.
     pub fn generate_pdf(doc: &Document, path: &Path) -> Result<(), String> {
+        // Фильтруем неподдерживаемые символы.
+        let doc = filter_document(doc);
+
         let font_family = load_font_family()
             .map_err(|e| format!("Не удалось загрузить шрифт: {}", e))?;
 
@@ -921,11 +1251,11 @@ pub mod pdf {
 
         pdf.push(render_title(&doc.number, &doc.date));
         pdf.push(render_supplier_block());
-        pdf.push(render_table(doc));
-        pdf.push(render_total_row(doc));
-        pdf.push(render_total_count(doc));
-        pdf.push(render_amount_in_words(doc));
-        pdf.push(render_payment_block(doc));
+        pdf.push(render_table(&doc));
+        pdf.push(render_total_row(&doc));
+        pdf.push(render_total_count(&doc));
+        pdf.push(render_amount_in_words(&doc));
+        pdf.push(render_payment_block(&doc));
         pdf.push(render_signatures_block());
 
         pdf.render_to_file(path).map_err(|e| format!("Ошибка записи PDF: {}", e))?;
@@ -1145,6 +1475,57 @@ pub mod pdf {
             None => String::new(),
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn filter_keeps_basic_cyrillic() {
+            let s = filter_unsupported("Привет, мир!");
+            assert_eq!(s, "Привет, мир!");
+        }
+
+        #[test]
+        fn filter_keeps_pipe_and_slash() {
+            // Символы |, /, -, _, кавычки — должны поддерживаться DejaVu Serif.
+            let s = filter_unsupported("Подшипник | зад прав/лев | LADA");
+            assert_eq!(s, "Подшипник | зад прав/лев | LADA");
+        }
+
+        #[test]
+        fn filter_removes_emoji() {
+            // Эмодзи нет в DejaVu Serif — должны быть удалены.
+            let s = filter_unsupported("Товар 🚀!");
+            assert_eq!(s, "Товар !");
+        }
+
+        #[test]
+        fn filter_removes_chinese_chars() {
+            // Китайские иероглифы не поддерживаются DejaVu Serif.
+            let s = filter_unsupported("Товар 你好!");
+            assert_eq!(s, "Товар !");
+        }
+
+        #[test]
+        fn filter_keeps_special_symbols() {
+            // Спецсимволы: №, ±, °, ×, ÷, «» — DejaVu Serif их поддерживает.
+            let s = filter_unsupported("№ 123 ±0.5 °C × ÷ «кавычки»");
+            // Проверим, что ничего не удалено.
+            assert_eq!(s, "№ 123 ±0.5 °C × ÷ «кавычки»");
+        }
+
+        #[test]
+        fn filter_preserves_newlines() {
+            let s = filter_unsupported("Строка 1\nСтрока 2\tTab");
+            assert_eq!(s, "Строка 1\nСтрока 2\tTab");
+        }
+
+        #[test]
+        fn filter_empty_string() {
+            assert_eq!(filter_unsupported(""), "");
+        }
+    }
 }
 
 // ============================================================================
@@ -1285,6 +1666,134 @@ pub mod gui {
             }
         }
 
+        /// Открывает файловый диалог и импортирует CSV из выбранного файла.
+        /// Импортированные строки ДОБАВЛЯЮТСЯ к текущим (не заменяют).
+        fn import_csv_from_file(&mut self) {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("CSV файлы", &["csv", "txt"])
+                .add_filter("Все файлы", &["*"])
+                .set_title("Выберите CSV-файл от поставщика")
+                .pick_file()
+            {
+                match crate::csv_import::parse_csv_file(&path) {
+                    Ok(result) => {
+                        // Добавляем импортированные строки к существующим.
+                        // Сначала удаляем пустые строки в конце.
+                        while let Some(last) = self.doc.lines.last() {
+                            if !last.is_filled() {
+                                self.doc.lines.pop();
+                            } else {
+                                break;
+                            }
+                        }
+                        self.doc.lines.extend(result.items);
+                        // Гарантируем хотя бы одну пустую строку в конце.
+                        if self.doc.lines.is_empty() {
+                            self.doc.lines.push(LineItem::empty());
+                        }
+                        self.status_message = result.message;
+                    }
+                    Err(e) => {
+                        self.status_message = format!("Ошибка импорта: {}", e);
+                    }
+                }
+            }
+        }
+
+        /// Читает CSV из буфера обмена и импортирует строки.
+        fn import_csv_from_clipboard(&mut self, _ctx: &egui::Context) {
+            // Используем arboard для чтения буфера обмена — egui 0.29
+            // не предоставляет API для чтения, только для записи (copy_text).
+            let clipboard_text: Option<String> = arboard::Clipboard::new()
+                .ok()
+                .and_then(|mut cb| cb.get_text().ok());
+            match clipboard_text {
+                Some(text) => {
+                    let result = crate::csv_import::parse_csv_text(&text);
+                    if result.items.is_empty() {
+                        self.status_message = format!(
+                            "В буфере не найдено строк для импорта. {}",
+                            result.message
+                        );
+                        return;
+                    }
+                    // Добавляем импортированные строки к существующим.
+                    while let Some(last) = self.doc.lines.last() {
+                        if !last.is_filled() {
+                            self.doc.lines.pop();
+                        } else {
+                            break;
+                        }
+                    }
+                    self.doc.lines.extend(result.items);
+                    if self.doc.lines.is_empty() {
+                        self.doc.lines.push(LineItem::empty());
+                    }
+                    self.status_message = format!(
+                        "Импорт из буфера: {}",
+                        result.message
+                    );
+                }
+                None => {
+                    self.status_message =
+                        "Буфер обмена пуст или не содержит текста".to_string();
+                }
+            }
+        }
+
+        /// Копирует текст заявки в буфер обмена — для отправки в Telegram,
+        /// мессенджеры или email. Формат: читаемый текст с переносами строк.
+        fn copy_to_clipboard(&mut self, ctx: &egui::Context) {
+            let total = self.doc.total();
+            let total_str = fmt::format_money(total);
+            let total_words = crate::money_words::amount_to_words(total);
+            let n = self.doc.filled_count();
+            let x = fmt::format_rubles_rounded(total);
+
+            let mut text = String::new();
+            text.push_str(&format!(
+                "Заявка на отгрузку № {} от {}\n",
+                self.doc.number, self.doc.date
+            ));
+            text.push('\n');
+            text.push_str(&format!("Поставщик: {}\n", crate::model::SUPPLIER_NAME));
+            text.push('\n');
+
+            // Таблица в текстовом виде — просто пронумерованный список.
+            let mut idx = 1u32;
+            for line in self.doc.filled_lines() {
+                let qty = line.qty_value().unwrap_or(0.0);
+                let price = line.price_value().unwrap_or(0.0);
+                let sum = line.sum_value().unwrap_or(0.0);
+                text.push_str(&format!(
+                    "{}. {} — {} {} × {} = {} руб.\n",
+                    idx,
+                    line.name,
+                    format_qty_short(qty),
+                    line.unit.as_str(),
+                    fmt::format_money(price),
+                    fmt::format_money(sum),
+                ));
+                idx += 1;
+            }
+
+            text.push('\n');
+            text.push_str(&format!("Итого: {} руб.\n", total_str));
+            text.push_str(&format!(
+                "Всего наименований {}, на сумму {} руб.\n",
+                n, x
+            ));
+            text.push_str(&format!("{}\n", total_words));
+            text.push('\n');
+            text.push_str(&format!("Оплата / Наличные {}\n", total_str));
+            text.push_str("Сдача 0,00\n");
+
+            ctx.copy_text(text);
+            self.status_message =
+                "Заявка скопирована в буфер обмена — можно вставить в Telegram"
+                    .to_string();
+        }
+
         fn ensure_trailing_empty(&mut self) {
             if let Some(last) = self.doc.lines.last() {
                 if last.is_filled() {
@@ -1370,7 +1879,18 @@ pub mod gui {
                         self.add_empty_line();
                     }
                     ui.separator();
-                    if ui.button("📋 История").clicked() {
+                    if ui.button("📥 Импорт CSV").clicked() {
+                        self.import_csv_from_file();
+                    }
+                    if ui.button("📋 Вставить из буфера").clicked() {
+                        self.import_csv_from_clipboard(ctx);
+                    }
+                    ui.separator();
+                    if ui.button("📑 Копировать текст").clicked() {
+                        self.copy_to_clipboard(ctx);
+                    }
+                    ui.separator();
+                    if ui.button("🗂 История").clicked() {
                         // Обновляем кэш истории при открытии окна.
                         let store = HistoryStore::new(self.history_dir.clone());
                         self.history_entries = store.list();
