@@ -52,7 +52,7 @@ pub mod fmt {
     /// Форматирует целое число с разделителем разрядов (неразрывный пробел).
     pub fn format_int_groups(n: i64) -> String {
         let neg = n < 0;
-        let mut n = n.unsigned_abs() as u64;
+        let mut n = n.unsigned_abs();
         if n == 0 { return "0".to_string(); }
         let mut groups: Vec<u64> = Vec::new();
         while n > 0 {
@@ -229,10 +229,10 @@ pub mod money_words {
         let n = n.unsigned_abs();
         let last_two = n % 100;
         let last = n % 10;
-        if last_two >= 11 && last_two <= 14 { return many; }
+        if (11..=14).contains(&last_two) { return many; }
         match last {
             1 => one,
-            2 | 3 | 4 => few,
+            2..=4 => few,
             _ => many,
         }
     }
@@ -243,10 +243,9 @@ pub mod money_words {
         let mut n = rubles;
         let mut millions = 0i64;
         let mut thousands = 0i64;
-        let units;
         if n >= 1_000_000 { millions = n / 1_000_000; n %= 1_000_000; }
         if n >= 1_000 { thousands = n / 1_000; n %= 1_000; }
-        units = n;
+        let units = n;
         if millions > 0 {
             parts.push(format!("{} {}", three_digit_words(millions, Gender::Masculine), million_word(millions)));
         }
@@ -476,9 +475,9 @@ pub mod model {
 
     /// Генерирует номер: `DZHOД` + 6 случайных цифр.
     pub fn generate_number() -> String {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        let n: u32 = rng.gen_range(0..1_000_000);
+        use rand::RngExt;
+        let mut rng = rand::rng();
+        let n: u32 = rng.random_range(0..1_000_000);
         format!("{}{:06}", NUMBER_PREFIX, n)
     }
 
@@ -1166,13 +1165,14 @@ pub mod pdf {
     // Фильтрация неподдерживаемых символов
     // ============================================================================
 
-    /// Thread-local кэш распарсенного шрифта. Face парсится один раз на поток,
-    /// потом используется для проверки отдельных символов через `glyph_index`.
-    /// `glyph_index` очень быстрый (O(log n) в cmap), поэтому фильтрация
-    /// строк не создаёт накладных расходов.
+    // Thread-local кэш распарсенного шрифта. Face парсится один раз на поток,
+    // потом используется для проверки отдельных символов через `glyph_index`.
+    // `glyph_index` очень быстрый (O(log n) в cmap), поэтому фильтрация
+    // строк не создаёт накладных расходов.
     thread_local! {
-        static FONT_FACE: std::cell::RefCell<Option<ttf_parser::Face<'static>>> =
-            std::cell::RefCell::new(None);
+        static FONT_FACE: std::cell::RefCell<Option<ttf_parser::Face<'static>>> = const {
+            std::cell::RefCell::new(None)
+        };
     }
 
     /// Проверяет, поддерживает ли шрифт данный символ.
@@ -1319,8 +1319,7 @@ pub mod pdf {
         ];
         let _ = table.push_row(header);
 
-        let mut idx = 1u32;
-        for line in doc.filled_lines() {
+        for (idx, line) in (1u32..).zip(doc.filled_lines()) {
             let sum = line.sum_value().unwrap_or(0.0);
             let qty_str = format_qty(line.qty_value());
             let price_str = format_price(line.price_value());
@@ -1336,7 +1335,6 @@ pub mod pdf {
                 Box::new(styled_paragraph(&sum_str, Style::new(), Alignment::Center)),
             ];
             let _ = table.push_row(row);
-            idx += 1;
         }
 
         // Итоговая строка УБРАНА из таблицы — теперь «Итого:» отдельной
@@ -1357,7 +1355,7 @@ pub mod pdf {
         let mut table = el::TableLayout::new(vec![5, 2]);
         table.set_cell_decorator(frame);
         let row: Vec<Box<dyn Element>> = vec![
-            Box::new(styled_paragraph("Итого:", bold.clone(), Alignment::Right)),
+            Box::new(styled_paragraph("Итого:", bold, Alignment::Right)),
             Box::new(styled_paragraph(&total_str, bold, Alignment::Center)),
         ];
         let _ = table.push_row(row);
@@ -1411,7 +1409,7 @@ pub mod pdf {
         let row: Vec<Box<dyn Element>> = vec![
             Box::new(
                 el::Paragraph::new("Отпустил: ______________________")
-                    .styled(line_style.clone()),
+                    .styled(line_style),
             ),
             Box::new(
                 el::Paragraph::new("Получил: ______________________")
@@ -1426,7 +1424,7 @@ pub mod pdf {
         sub_table.set_cell_decorator(el::FrameCellDecorator::new(false, false, false));
         let small_style = Style::new().with_font_size(FONT_SIZE_SMALL);
         let sub_row: Vec<Box<dyn Element>> = vec![
-            Box::new(el::Paragraph::new("              (подпись)").styled(small_style.clone())),
+            Box::new(el::Paragraph::new("              (подпись)").styled(small_style)),
             Box::new(
                 el::Paragraph::new("              (подпись)")
                     .aligned(Alignment::Right)
@@ -1760,8 +1758,7 @@ pub mod gui {
             text.push('\n');
 
             // Таблица в текстовом виде — просто пронумерованный список.
-            let mut idx = 1u32;
-            for line in self.doc.filled_lines() {
+            for (idx, line) in (1u32..).zip(self.doc.filled_lines()) {
                 let qty = line.qty_value().unwrap_or(0.0);
                 let price = line.price_value().unwrap_or(0.0);
                 let sum = line.sum_value().unwrap_or(0.0);
@@ -1774,7 +1771,6 @@ pub mod gui {
                     fmt::format_money(price),
                     fmt::format_money(sum),
                 ));
-                idx += 1;
             }
 
             text.push('\n');
@@ -1806,13 +1802,13 @@ pub mod gui {
     }
 
     impl eframe::App for App {
-        fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        fn on_exit(&mut self) {
             self.save_draft();
         }
 
-        fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
             let title = format!("Заявка на отгрузку № {} — {}", self.doc.number, APP_NAME);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Title(title));
 
             if self.show_new_doc_dialog {
                 let mut open = true;
@@ -1820,7 +1816,7 @@ pub mod gui {
                     .collapsible(false)
                     .resizable(false)
                     .open(&mut open)
-                    .show(ctx, |ui| {
+                    .show(ui, |ui| {
                         ui.label("Очистить таблицу и сгенерировать новый номер заявки?");
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
@@ -1847,7 +1843,7 @@ pub mod gui {
                     .default_width(900.0)
                     .default_height(600.0)
                     .open(&mut open)
-                    .show(ctx, |ui| {
+                    .show(ui, |ui| {
                         self.render_history(ui);
                     });
                 if !open {
@@ -1855,17 +1851,17 @@ pub mod gui {
                 }
             }
 
-            egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
+            egui::Panel::bottom("status_bar").show(ui, |ui| {
                 ui.add_space(2.0);
                 ui.horizontal(|ui| { ui.label(&self.status_message); });
                 ui.add_space(2.0);
             });
 
-            egui::TopBottomPanel::bottom("totals_panel")
+            egui::Panel::bottom("totals_panel")
                 .resizable(false)
-                .show(ctx, |ui| { self.render_totals(ui); });
+                .show(ui, |ui| { self.render_totals(ui); });
 
-            egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+            egui::Panel::top("toolbar").show(ui, |ui| {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     if ui.button("Сформировать PDF").clicked() {
@@ -1883,11 +1879,11 @@ pub mod gui {
                         self.import_csv_from_file();
                     }
                     if ui.button("📋 Вставить из буфера").clicked() {
-                        self.import_csv_from_clipboard(ctx);
+                        self.import_csv_from_clipboard(ui.ctx());
                     }
                     ui.separator();
                     if ui.button("📑 Копировать текст").clicked() {
-                        self.copy_to_clipboard(ctx);
+                        self.copy_to_clipboard(ui.ctx());
                     }
                     ui.separator();
                     if ui.button("🗂 История").clicked() {
@@ -1909,7 +1905,7 @@ pub mod gui {
                 ui.add_space(4.0);
             });
 
-            egui::CentralPanel::default().show(ctx, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 self.render_table(ui);
             });
 
@@ -1992,7 +1988,7 @@ pub mod gui {
                         let w = widths.next().unwrap_or(80.0);
                         let sum_str = line
                             .sum_value()
-                            .map(|v| fmt::format_money(v))
+                            .map(fmt::format_money)
                             .unwrap_or_default();
                         ui.add_sized([w, 20.0], egui::Label::new(sum_str).selectable(false));
 
@@ -2081,10 +2077,10 @@ pub mod gui {
             let selected_idx = self.history_selected;
             let mut new_selection = selected_idx;
 
-            egui::SidePanel::left("history_list")
+            egui::Panel::left("history_list")
                 .resizable(true)
-                .default_width(380.0)
-                .show_inside(ui, |ui| {
+                .default_size(380.0)
+                .show(ui, |ui| {
                     ui.heading("Заявки:");
                     ui.separator();
                     egui::ScrollArea::vertical().show(ui, |ui| {
@@ -2099,13 +2095,14 @@ pub mod gui {
                                 total_str,
                                 entry.items_count,
                             );
-                            let resp = ui.add_sized(
-                                [ui.available_width(), 56.0],
-                                egui::SelectableLabel::new(is_selected, &button_text),
-                            );
-                            if resp.clicked() {
-                                new_selection = Some(i);
-                            }
+                            // selectable_label вместо SelectableLabel (убран в egui 0.36).
+                            let avail_w = ui.available_width();
+                            ui.allocate_ui(egui::Vec2::new(avail_w, 56.0), |ui| {
+                                let resp = ui.selectable_label(is_selected, &button_text);
+                                if resp.clicked() {
+                                    new_selection = Some(i);
+                                }
+                            });
                         }
                     });
                 });
@@ -2113,7 +2110,7 @@ pub mod gui {
             self.history_selected = new_selection;
 
             // Детали выбранной записи.
-            egui::CentralPanel::default().show_inside(ui, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 if let Some(idx) = self.history_selected {
                     if let Some(entry) = self.history_entries.get(idx) {
                         let entry_clone = entry.clone();

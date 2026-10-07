@@ -18,7 +18,7 @@
 // в lib.rs через cargo:rustc-env.
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const FONTS: &[(&str, &str, &str)] = &[
@@ -67,7 +67,7 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 }
 
-fn download(url: &str, dest: &PathBuf) -> bool {
+fn download(url: &str, dest: &Path) -> bool {
     // Способ 1: PowerShell (Windows). Invoke-WebRequest есть начиная с PowerShell 3.0.
     if cfg!(target_os = "windows") {
         let script = format!(
