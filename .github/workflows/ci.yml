@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "iter-*"]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test & Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libegl1 libgl1 libgl1-mesa-glx libssl-dev \
+            pkg-config
+
+      - name: Build (debug)
+        run: cargo build --all-targets
+
+      - name: Run tests
+        run: cargo test --all-targets
+        env:
+          WGPU_BACKEND: "gl"
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Upload release binary (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: zayavka-windows-${{ github.sha }}
+          path: target/release/zayavka.exe
+          if-no-files-found: warn
+
+      - name: Upload release binary (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: zayavka-linux-${{ github.sha }}
+          path: target/release/zayavka
+          if-no-files-found: warn
