@@ -410,6 +410,48 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
         }
 
+        // Горячие клавиши. egui даёт доступ к состоянию модификаторов и
+        // нажатым клавишам через `ctx.input(|i| ...)`. Используем
+        // `i.key_pressed(...)` + `i.modifiers.ctrl` для проверки Ctrl.
+        //
+        // ВАЖНО: `i.consume_key(...)` не используем — он удаляет событие,
+        // и текстовые поля egui (TextEdit) могут не получить его. Просто
+        // проверяем нажатие и вызываем действие. Если фокус в TextEdit,
+        // Ctrl+N / Ctrl+P / Ctrl+S всё равно сработают как горячие клавиши.
+        //
+        // Исключение: Ctrl+S в TextEdit обычно вставляет символ, но в egui
+        // Ctrl+S не имеет стандартного действия — мы его перехватываем.
+        ctx.input(|i| {
+            // Ctrl+N — новая заявка (с подтверждением через диалог).
+            if i.key_pressed(egui::Key::N) && i.modifiers.ctrl {
+                self.show_new_doc_dialog = true;
+            }
+            // Ctrl+P — сформировать PDF.
+            // На Windows Ctrl+P — печать в браузерах, но в окне приложения
+            // это наш обработчик. egui не перехватывает его по умолчанию.
+            if i.key_pressed(egui::Key::P) && i.modifiers.ctrl && !i.modifiers.shift {
+                self.generate_and_open_pdf();
+            }
+            // Ctrl+S — принудительное сохранение черновика (минуя debounce).
+            if i.key_pressed(egui::Key::S) && i.modifiers.ctrl {
+                self.save_draft();
+                self.dirty = false;
+                self.last_change = None;
+                self.status_message = "Черновик сохранён (Ctrl+S)".to_string();
+            }
+            // Ctrl+Shift+H — открыть окно истории.
+            if i.key_pressed(egui::Key::H) && i.modifiers.ctrl && i.modifiers.shift {
+                let store = HistoryStore::new(self.history_dir.clone());
+                self.history_entries = store.list();
+                self.history_selected = None;
+                self.show_history_window = true;
+            }
+            // Ctrl+Shift+T — переключить тему.
+            if i.key_pressed(egui::Key::T) && i.modifiers.ctrl && i.modifiers.shift {
+                self.toggle_theme(&ctx);
+            }
+        });
+
         if self.show_new_doc_dialog {
             let mut open = true;
             egui::Window::new("Новая заявка")
