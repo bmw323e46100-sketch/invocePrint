@@ -38,7 +38,9 @@ impl LineItem {
     pub fn empty() -> Self {
         Self {
             name: String::new(),
-            qty: String::new(),
+            // По умолчанию qty=1 — большинство товаров заказывают по 1 шт.
+            // Раньше было пусто, что заставляло пользователя вводить «1» в каждой строке.
+            qty: "1".to_string(),
             unit: Unit::Sht,
             price: String::new(),
         }
