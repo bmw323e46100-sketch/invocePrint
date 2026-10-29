@@ -43,7 +43,9 @@ fn main() -> eframe::Result<()> {
 
 /// Определяет пути для черновика, PDF и истории:
 /// - предпочтительно: рядом с исполняемым файлом (current_exe).
-/// - запас: каталог данных приложения (home/.local/share/zayavka или %APPDATA%/zayavka).
+/// - запас: каталог данных приложения через крейт `dirs`
+///   (Linux: ~/.local/share/zayavka, Windows: %APPDATA%/zayavka,
+///    macOS: ~/Library/Application Support/zayavka).
 fn resolve_paths() -> (PathBuf, PathBuf, PathBuf) {
     let exe_dir = std::env::current_exe()
         .ok()
@@ -61,31 +63,17 @@ fn resolve_paths() -> (PathBuf, PathBuf, PathBuf) {
         }
     }
 
-    // Запасной вариант: каталог данных пользователя.
-    let base = dirs_or_appdata();
+    // Запасной вариант: каталог данных пользователя через крейт `dirs`.
+    // Раньше здесь была ручная реализация dirs_or_appdata() с тремя
+    // ветками (Linux/Windows/macOS) — теперь используем проверенный крейт.
+    // Если по какой-то причине dirs::data_dir() вернул None (нет HOME
+    // и нет %APPDATA%) — откатываемся к ./zayavka_data в текущей директории.
+    let base = dirs::data_dir()
+        .map(|d| d.join("zayavka"))
+        .unwrap_or_else(|| PathBuf::from("./zayavka_data"));
     let _ = std::fs::create_dir_all(&base);
     let draft = base.join("zayavka_draft.json");
     let pdf_dir = base.join("Заявки");
     let history_dir = base.join("История");
     (draft, pdf_dir, history_dir)
-}
-
-/// Возвращает каталог данных приложения в зависимости от платформы.
-fn dirs_or_appdata() -> PathBuf {
-    // Linux: ~/.local/share/zayavka
-    // Windows: %APPDATA%/zayavka
-    // macOS: ~/Library/Application Support/zayavka
-    if let Some(home) = std::env::var_os("HOME") {
-        let p = PathBuf::from(home).join(".local/share/zayavka");
-        if std::fs::create_dir_all(&p).is_ok() {
-            return p;
-        }
-    }
-    if cfg!(target_os = "windows") {
-        if let Some(appdata) = std::env::var_os("APPDATA") {
-            let p = PathBuf::from(appdata).join("zayavka");
-            return p;
-        }
-    }
-    PathBuf::from("./zayavka_data")
 }

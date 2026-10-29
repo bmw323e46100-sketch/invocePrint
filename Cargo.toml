@@ -27,6 +27,7 @@ ron = "0.12"
 open = "5"
 ttf-parser = "0.25"
 arboard = "3"
+dirs = "5"
 
 [profile.release]
 opt-level = 3
