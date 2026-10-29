@@ -429,7 +429,7 @@ pub mod model {
         pub fn empty() -> Self {
             Self {
                 name: String::new(),
-                qty: String::new(),
+                qty: "1".to_string(),
                 unit: Unit::Sht,
                 price: String::new(),
             }
@@ -1533,7 +1533,7 @@ pub mod pdf {
 /// Модуль графического интерфейса на egui.
 pub mod gui {
     use crate::fmt;
-    use crate::history::{HistoryEntry, HistoryStore};
+    use crate::history::{HistoryEntry, HistoryItem, HistoryStore};
     use crate::model::{self, Document, LineItem, Unit};
     use crate::pdf;
     use crate::APP_NAME;
@@ -1561,6 +1561,12 @@ pub mod gui {
         pub history_selected: Option<usize>,
         /// Флаг тёмной темы (true = тёмная, false = светлая).
         pub dark_theme: bool,
+        /// Стек предыдущих состояний документа для Undo (Ctrl+Z).
+        pub undo_stack: Vec<Vec<LineItem>>,
+        /// Показывать окно ввода процента наценки.
+        pub show_markup_dialog: bool,
+        /// Текущее значение процента наценки в окне.
+        pub markup_input: String,
     }
 
     impl App {
@@ -1589,7 +1595,50 @@ pub mod gui {
                 history_entries: Vec::new(),
                 history_selected: None,
                 dark_theme: false,
+                undo_stack: Vec::new(),
+                show_markup_dialog: false,
+                markup_input: "10".to_string(),
             }
+        }
+
+        /// Сохраняет снимок строк в стек Undo.
+        fn push_undo(&mut self) {
+            const MAX_UNDO: usize = 50;
+            if self.undo_stack.len() >= MAX_UNDO {
+                self.undo_stack.remove(0);
+            }
+            self.undo_stack.push(self.doc.lines.clone());
+        }
+
+        /// Откат последнего действия.
+        fn undo(&mut self) {
+            if let Some(prev_lines) = self.undo_stack.pop() {
+                self.doc.lines = prev_lines;
+                self.status_message = "Действие отменено (Ctrl+Z)".to_string();
+                if self.doc.lines.is_empty() {
+                    self.doc.lines.push(LineItem::empty());
+                }
+            } else {
+                self.status_message = "Нечего отменять".to_string();
+            }
+        }
+
+        /// Применяет процент наценки ко всем строкам с ценой.
+        fn apply_markup(&mut self, percent: f64) {
+            self.push_undo();
+            let multiplier = 1.0 + percent / 100.0;
+            let mut affected = 0usize;
+            for line in &mut self.doc.lines {
+                if let Some(price) = line.price_value() {
+                    let new_price = (price * multiplier * 100.0).round() / 100.0;
+                    line.price = format!("{:.2}", new_price);
+                    affected += 1;
+                }
+            }
+            self.status_message = format!(
+                "Наценка {}% применена к {} строкам",
+                percent, affected
+            );
         }
 
         /// Переключает между тёмной и светлой темой.
@@ -1618,6 +1667,7 @@ pub mod gui {
         }
 
         fn new_document(&mut self) {
+            self.push_undo();
             self.doc = Document {
                 number: model::generate_number(),
                 date: fmt::today_string(),
@@ -1670,11 +1720,13 @@ pub mod gui {
         }
 
         fn add_empty_line(&mut self) {
+            self.push_undo();
             self.doc.lines.push(LineItem::empty());
         }
 
         fn remove_line(&mut self, idx: usize) {
             if idx < self.doc.lines.len() {
+                self.push_undo();
                 self.doc.lines.remove(idx);
                 if self.doc.lines.is_empty() {
                     self.doc.lines.push(LineItem::empty());
@@ -1700,6 +1752,7 @@ pub mod gui {
                         return;
                     }
                     // Добавляем импортированные строки к существующим.
+                    self.push_undo();
                     while let Some(last) = self.doc.lines.last() {
                         if !last.is_filled() {
                             self.doc.lines.pop();
@@ -1723,46 +1776,57 @@ pub mod gui {
             }
         }
 
-        /// Копирует текст заявки в буфер обмена — для отправки в Telegram,
-        /// мессенджеры или email. Формат: только список товаров + итоги
-        /// (без шапки с номером заявки и поставщиком — по запросу пользователя).
+        /// Копирует текст заявки в буфер обмена — для отправки в Telegram.
         fn copy_to_clipboard(&mut self, ctx: &egui::Context) {
             let total = self.doc.total();
-            let total_str = fmt::format_money(total);
             let total_words = crate::money_words::amount_to_words(total);
             let n = self.doc.filled_count();
             let x = fmt::format_rubles_rounded(total);
 
-            let mut text = String::new();
+            let chat_lines: Vec<ChatLineInfo> = self
+                .doc
+                .filled_lines()
+                .into_iter()
+                .map(|line| ChatLineInfo {
+                    name: line.name.clone(),
+                    qty: line.qty_value().unwrap_or(0.0),
+                    unit: line.unit.as_str().to_string(),
+                    price: line.price_value().unwrap_or(0.0),
+                    sum: line.sum_value().unwrap_or(0.0),
+                })
+                .collect();
 
-            // Список товаров — без шапки, сразу нумерованный список.
-            for (idx, line) in (1u32..).zip(self.doc.filled_lines()) {
-                let qty = line.qty_value().unwrap_or(0.0);
-                let price = line.price_value().unwrap_or(0.0);
-                let sum = line.sum_value().unwrap_or(0.0);
-                text.push_str(&format!(
-                    "{}. {} — {} {} × {} = {} руб.\n",
-                    idx,
-                    line.name,
-                    format_qty_short(qty),
-                    line.unit.as_str(),
-                    fmt::format_money(price),
-                    fmt::format_money(sum),
-                ));
-            }
-
-            text.push('\n');
-            text.push_str(&format!("Итого: {} руб.\n", total_str));
-            text.push_str(&format!(
-                "Всего наименований {}, на сумму {} руб.\n",
-                n, x
-            ));
-            text.push_str(&format!("{}\n", total_words));
-
+            let text = format_lines_for_chat(&chat_lines, total, &total_words, n, x);
             ctx.copy_text(text);
             self.status_message =
                 "Заявка скопирована в буфер обмена — можно вставить в Telegram"
                     .to_string();
+        }
+
+        /// Копирует выбранную запись из истории в буфер обмена.
+        fn copy_history_to_clipboard(
+            &mut self,
+            ctx: &egui::Context,
+            items: &[HistoryItem],
+            total: f64,
+            total_words: &str,
+            n: usize,
+        ) {
+            let x = fmt::format_rubles_rounded(total);
+            let chat_lines: Vec<ChatLineInfo> = items
+                .iter()
+                .map(|item| ChatLineInfo {
+                    name: item.name.clone(),
+                    qty: item.qty,
+                    unit: item.unit.clone(),
+                    price: item.price,
+                    sum: item.sum,
+                })
+                .collect();
+            let text = format_lines_for_chat(&chat_lines, total, total_words, n, x);
+            ctx.copy_text(text);
+            self.status_message =
+                "Запись из истории скопирована в буфер обмена".to_string();
         }
 
         fn ensure_trailing_empty(&mut self) {
@@ -1782,11 +1846,20 @@ pub mod gui {
         }
 
         fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-            // Применяем тему каждый кадр — гарантирует, что тема не «слетит».
             self.apply_theme(ui.ctx());
 
+            // Ctrl+Z — откат последнего действия.
+            let ctx = ui.ctx();
+            let undo_pressed = ctx.input(|i| {
+                i.key_pressed(egui::Key::Z)
+                    && (i.modifiers.ctrl || i.modifiers.command)
+            });
+            if undo_pressed && !ctx.egui_wants_keyboard_input() {
+                self.undo();
+            }
+
             let title = format!("Заявка на отгрузку № {} — {}", self.doc.number, APP_NAME);
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Title(title));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
 
             if self.show_new_doc_dialog {
                 let mut open = true;
@@ -1829,6 +1902,47 @@ pub mod gui {
                 }
             }
 
+            // Окно ввода процента наценки.
+            if self.show_markup_dialog {
+                let mut open = true;
+                egui::Window::new("Наценка на все товары")
+                    .collapsible(false)
+                    .resizable(false)
+                    .open(&mut open)
+                    .show(ui, |ui| {
+                        ui.label("Введите процент наценки (10 = +10% к цене):");
+                        ui.add_space(4.0);
+                        ui.text_edit_singleline(&mut self.markup_input);
+                        ui.add_space(4.0);
+                        ui.label("Цены всех строк будут увеличены. Undo: Ctrl+Z.");
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Применить").clicked() {
+                                let cleaned: String = self.markup_input
+                                    .chars()
+                                    .filter(|c| !c.is_whitespace())
+                                    .map(|c| if c == ',' { '.' } else { c })
+                                    .collect();
+                                match cleaned.parse::<f64>() {
+                                    Ok(p) => {
+                                        self.apply_markup(p);
+                                        self.show_markup_dialog = false;
+                                    }
+                                    Err(_) => {
+                                        self.status_message = "Некорректный процент".to_string();
+                                    }
+                                }
+                            }
+                            if ui.button("Отмена").clicked() {
+                                self.show_markup_dialog = false;
+                            }
+                        });
+                    });
+                if !open {
+                    self.show_markup_dialog = false;
+                }
+            }
+
             egui::Panel::bottom("status_bar").show(ui, |ui| {
                 ui.add_space(2.0);
                 ui.horizontal(|ui| { ui.label(&self.status_message); });
@@ -1852,6 +1966,9 @@ pub mod gui {
                     if ui.button("+ Добавить строку").clicked() {
                         self.add_empty_line();
                     }
+                    if ui.button("Отменить (Ctrl+Z)").clicked() {
+                        self.undo();
+                    }
                     ui.separator();
                     // Импорт только из буфера обмена — без файлового диалога.
                     if ui.button("Вставить из буфера").clicked() {
@@ -1860,6 +1977,11 @@ pub mod gui {
                     ui.separator();
                     if ui.button("Копировать текст").clicked() {
                         self.copy_to_clipboard(ui.ctx());
+                    }
+                    ui.separator();
+                    // Наценка на все товары — открывает диалог ввода процента.
+                    if ui.button("Наценка %").clicked() {
+                        self.show_markup_dialog = true;
                     }
                     ui.separator();
                     // Кнопка истории — текст, не эмодзи (егui не рендерит эмодзи).
@@ -2161,6 +2283,17 @@ pub mod gui {
                                     let _ = open::that(pdf);
                                 }
                             }
+                            // Кнопка копирования заявки из истории в буфер обмена.
+                            if ui.button("Скопировать в чат").clicked() {
+                                let ctx = ui.ctx().clone();
+                                self.copy_history_to_clipboard(
+                                    &ctx,
+                                    &entry_clone.items,
+                                    entry_clone.total,
+                                    &entry_clone.total_words,
+                                    entry_clone.items_count,
+                                );
+                            }
                             if ui.button("Удалить из истории").clicked() {
                                 let store = HistoryStore::new(self.history_dir.clone());
                                 match store.delete(&entry_clone.number, &entry_clone.timestamp) {
@@ -2195,6 +2328,46 @@ pub mod gui {
         } else {
             format!("{:.3}", v).replace('.', ",")
         }
+    }
+
+    /// Унифицированная информация о строке товара для копирования в чат.
+    struct ChatLineInfo {
+        name: String,
+        qty: f64,
+        unit: String,
+        price: f64,
+        sum: f64,
+    }
+
+    /// Форматирует список товаров в текст для отправки в мессенджер.
+    fn format_lines_for_chat(
+        lines: &[ChatLineInfo],
+        total: f64,
+        total_words: &str,
+        n: usize,
+        x: String,
+    ) -> String {
+        let mut text = String::new();
+        for (idx, line) in (1u32..).zip(lines.iter()) {
+            text.push_str(&format!(
+                "{}. {} — {} {} × {} = {} руб.\n",
+                idx,
+                line.name,
+                format_qty_short(line.qty),
+                line.unit,
+                fmt::format_money(line.price),
+                fmt::format_money(line.sum),
+            ));
+        }
+        text.push('\n');
+        text.push_str(&format!("Итого: {} руб.\n", fmt::format_money(total)));
+        text.push_str(&format!(
+            "Всего наименований {}, на сумму {} руб.\n",
+            n, x
+        ));
+        text.push_str(total_words);
+        text.push('\n');
+        text
     }
 
     fn filled_signature(doc: &Document) -> u64 {
