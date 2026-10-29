@@ -56,6 +56,11 @@ pub struct App {
     pub show_markup_dialog: bool,
     /// Текущее значение процента наценки в окне (строка, парсится в f64).
     pub markup_input: String,
+    /// Показывать окно предпросмотра текста для копирования в мессенджер.
+    /// В окне можно отредактировать текст перед копированием.
+    pub show_copy_dialog: bool,
+    /// Текущий текст в окне предпросмотра. Редактируется пользователем.
+    pub copy_dialog_text: String,
     /// Канал для получения результата фоновой генерации PDF.
     pdf_result_rx: Option<std::sync::mpsc::Receiver<PdfResult>>,
 }
@@ -102,6 +107,8 @@ impl App {
             undo_stack: Vec::new(),
             show_markup_dialog: false,
             markup_input: "10".to_string(),
+            show_copy_dialog: false,
+            copy_dialog_text: String::new(),
             pdf_result_rx: None,
         }
     }
@@ -389,14 +396,15 @@ impl App {
         }
     }
 
-    /// Копирует текст заявки в буфер обмена — для отправки в Telegram.
-    /// Использует общую функцию format_lines_for_chat, чтобы переиспользовать
-    /// код с копированием записи из истории.
-    fn copy_to_clipboard(&mut self, ctx: &egui::Context) {
+    /// Открывает диалог предпросмотра текста для копирования в мессенджер.
+    ///
+    /// Текст генерируется в формате «вариант D» (emoji + бренд/артикул на
+    /// отдельной строке) и помещается в редактируемое поле. Пользователь
+    /// может поправить текст перед копированием.
+    fn open_copy_dialog(&mut self) {
         let total = self.doc.total();
         let total_words = crate::money_words::amount_to_words(total);
         let n = self.doc.filled_count();
-        let x = fmt::format_rubles_rounded(total);
 
         let chat_lines: Vec<ChatLineInfo> = self
             .doc
@@ -411,24 +419,26 @@ impl App {
             })
             .collect();
 
-        let text = format_lines_for_chat(&chat_lines, total, &total_words, n, x);
-        ctx.copy_text(text);
-        self.status_message =
-            "Заявка скопирована в буфер обмена — можно вставить в Telegram"
-                .to_string();
+        self.copy_dialog_text = format_lines_for_messenger(
+            &chat_lines,
+            &self.doc.number,
+            total,
+            &total_words,
+            n,
+        );
+        self.show_copy_dialog = true;
     }
 
-    /// Копирует выбранную запись из истории в буфер обмена.
-    /// Использует ту же функцию format_lines_for_chat, что и copy_to_clipboard.
-    fn copy_history_to_clipboard(
+    /// Открывает диалог предпросмотра для записи из истории.
+    /// Тот же формат, что и open_copy_dialog, но данные из HistoryEntry.
+    fn open_copy_dialog_for_history(
         &mut self,
-        ctx: &egui::Context,
         items: &[HistoryItem],
+        doc_number: &str,
         total: f64,
         total_words: &str,
         n: usize,
     ) {
-        let x = fmt::format_rubles_rounded(total);
         let chat_lines: Vec<ChatLineInfo> = items
             .iter()
             .map(|item| ChatLineInfo {
@@ -439,10 +449,14 @@ impl App {
                 sum: item.sum,
             })
             .collect();
-        let text = format_lines_for_chat(&chat_lines, total, total_words, n, x);
-        ctx.copy_text(text);
-        self.status_message =
-            "Запись из истории скопирована в буфер обмена".to_string();
+        self.copy_dialog_text = format_lines_for_messenger(
+            &chat_lines,
+            doc_number,
+            total,
+            total_words,
+            n,
+        );
+        self.show_copy_dialog = true;
     }
 
     fn ensure_trailing_empty(&mut self) {
@@ -529,6 +543,12 @@ impl eframe::App for App {
             // Ctrl+Shift+T — переключить тему.
             if i.key_pressed(egui::Key::T) && i.modifiers.ctrl && i.modifiers.shift {
                 self.toggle_theme(&ctx);
+            }
+            // Ctrl+Shift+C — открыть диалог копирования в чат.
+            // «C» — Copy, как в большинстве приложений. Shift+Ctrl чтобы
+            // не конфликтовать с обычным Ctrl+C (копирование выделенного текста).
+            if i.key_pressed(egui::Key::C) && i.modifiers.ctrl && i.modifiers.shift {
+                self.open_copy_dialog();
             }
         });
 
@@ -634,6 +654,72 @@ impl eframe::App for App {
             }
         }
 
+        // Диалог предпросмотра текста для копирования в мессенджер.
+        // Текст уже сгенерирован в self.copy_dialog_text (формат «вариант D» —
+        // emoji + бренд/артикул на отдельной строке). Пользователь может
+        // отредактировать его в TextEdit перед копированием.
+        //
+        // Окно большое и немодальное (resizable) — удобно, когда текст длинный.
+        // При нажатии «Копировать» — копируем self.copy_dialog_text в буфер,
+        // закрываем окно, показываем статус.
+        if self.show_copy_dialog {
+            let mut open = true;
+            egui::Window::new("Копирование в чат")
+                .collapsible(false)
+                .resizable(true)
+                .default_width(640.0)
+                .default_height(480.0)
+                .min_width(400.0)
+                .min_height(300.0)
+                .open(&mut open)
+                .show(ui, |ui| {
+                    ui.label(
+                        "Текст в формате для мессенджера (Telegram/WhatsApp). \
+                         Можно отредактировать перед копированием:",
+                    );
+                    ui.add_space(4.0);
+
+                    // Большое многострочное текстовое поле.
+                    // .code_editor() даёт моноширинный шрифт и нумерацию строк,
+                    // но здесь лучше обычный TextEdit — текст будет читаемым
+                    // в пропорциональном шрифте, как в мессенджере.
+                    let available_height = ui.available_height() - 36.0;
+                    ui.add_sized(
+                        [ui.available_width(), available_height.max(80.0)],
+                        egui::TextEdit::multiline(&mut self.copy_dialog_text)
+                            .desired_width(f32::MAX)
+                            .font(egui::TextStyle::Monospace),
+                    );
+
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        // Кнопка «Копировать» — копирует текст из поля.
+                        if ui.button("📋 Копировать").clicked() {
+                            ui.ctx().copy_text(self.copy_dialog_text.clone());
+                            self.status_message =
+                                "Текст скопирован в буфер обмена".to_string();
+                            self.show_copy_dialog = false;
+                        }
+                        // Кнопка «Закрыть» — без копирования.
+                        if ui.button("Закрыть").clicked() {
+                            self.show_copy_dialog = false;
+                        }
+                        ui.separator();
+                        // Подсказка по формату — мелким шрифтом.
+                        ui.label(
+                            egui::RichText::new(
+                                "Формат: 🛒 шапка → 1️⃣ товар (бренд/артикул на новой строке) → 💰 итог",
+                            )
+                            .small()
+                            .color(egui::Color32::GRAY),
+                        );
+                    });
+                });
+            if !open {
+                self.show_copy_dialog = false;
+            }
+        }
+
         egui::Panel::bottom("status_bar").show(ui, |ui| {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
@@ -674,7 +760,7 @@ impl eframe::App for App {
                 }
                 ui.separator();
                 if ui.button("Копировать текст").clicked() {
-                    self.copy_to_clipboard(ui.ctx());
+                    self.open_copy_dialog();
                 }
                 ui.separator();
                 // Наценка на все товары — открывает диалог ввода процента.
@@ -929,10 +1015,11 @@ impl App {
         // освобождаем borrow после show(), затем выполняем действия.
         let mut open_pdf_request: Option<String> = None;
         let mut delete_request: Option<(String, String)> = None;
-        // (items, total, total_words, items_count) — нужно для копирования
-        // записи из истории в буфер обмена. Clone items — это компромисс:
-        // он копирует Vec<HistoryItem>, но только при клике пользователя.
-        let mut copy_history_request: Option<(Vec<HistoryItem>, f64, String, usize)> = None;
+        // (items, doc_number, total, total_words, items_count) — нужно для
+        // копирования записи из истории в буфер обмена. Clone items —
+        // компромисс: он копирует Vec<HistoryItem>, но только при клике
+        // пользователя. doc_number нужен для шапки «🛒 Заявка № ...».
+        let mut copy_history_request: Option<(Vec<HistoryItem>, String, f64, String, usize)> = None;
 
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(idx) = self.history_selected {
@@ -1009,6 +1096,7 @@ impl App {
                         if ui.button("Скопировать в чат").clicked() {
                             copy_history_request = Some((
                                 entry.items.clone(),
+                                entry.number.clone(),
                                 entry.total,
                                 entry.total_words.clone(),
                                 entry.items_count,
@@ -1046,10 +1134,10 @@ impl App {
                 }
             }
         }
-        if let Some((items, total, total_words, n)) = copy_history_request {
-            // Нужен клон ctx, т.к. borrow на ui ещё активен.
-            let ctx = ui.ctx().clone();
-            self.copy_history_to_clipboard(&ctx, &items, total, &total_words, n);
+        if let Some((items, doc_number, total, total_words, n)) = copy_history_request {
+            // Открываем диалог предпросмотра — пользователь может
+            // отредактировать текст перед копированием.
+            self.open_copy_dialog_for_history(&items, &doc_number, total, &total_words, n);
         }
     }
 }
@@ -1068,45 +1156,195 @@ struct ChatLineInfo {
     sum: f64,
 }
 
-/// Форматирует список товаров в текст для отправки в мессенджер.
+/// Форматирует список товаров в текст для мессенджера (вариант D).
 ///
-/// Формат:
+/// Формат с emoji и визуальной структурой. Бренд и артикул — на отдельной
+/// строке с отступом, чтобы основное наименование было легко прочитать
+/// на узком экране телефона в Telegram/WhatsApp.
+///
+/// Пример:
 /// ```text
-/// 1. Товар A — 2 шт × 100,00 = 200,00 руб.
-/// 2. Товар B — 1 к-кт × 500,00 = 500,00 руб.
+/// 🛒 Заявка № DZHOД123456
 ///
-/// Итого: 700,00 руб.
-/// Всего наименований 2, на сумму 700 руб.
-/// Семьсот рублей 00 копеек
+/// 1️⃣ Сайлентблок рычага подвески перед прав/лев LADA LARGUS
+///    LYNXauto (C8617) · 2 шт × 358,00 = 716,00 ₽
+///
+/// 2️⃣ Наконечник рулевой тяги перед лев LADA LARGUS/XRAY
+///    LYNXauto (C4147L) · 1 × 1 142,00 = 1 142,00 ₽
+///
+/// 💰 Итого: 3 930,22 ₽
+/// 📋 7 наименований
+/// Три тысячи девятьсот тридцать рублей 22 копейки
 /// ```
-fn format_lines_for_chat(
+///
+/// Особенности:
+/// - emoji используются как визуальные маркеры (🛒 заявка, 1️⃣ номер,
+///   💰 итог, 📋 количество). На большинстве мессенджеров рендерятся
+///   корректно (Telegram, WhatsApp, iMessage, VK).
+/// - Бренд и артикул (если есть в наименовании) переносятся на отдельную
+///   строку с отступом в 3 пробела — на телефоне основное наименование
+///   занимает первую строку целиком.
+/// - Если qty=1, «шт» не пишем — короче.
+/// - Если qty целое (2, 5, 8), показываем без дробной части.
+/// - «₽» вместо «руб.» — компактнее и современнее.
+/// - Неразрывный пробел NBSP в числах заменён на обычный — некоторые
+///   Android-клиенты Telegram рендерят NBSP как странный символ.
+fn format_lines_for_messenger(
     lines: &[ChatLineInfo],
+    doc_number: &str,
     total: f64,
     total_words: &str,
     n: usize,
-    x: String,
 ) -> String {
     let mut text = String::new();
+
+    // Шапка — короткая, только номер заявки.
+    text.push_str("🛒 Заявка № ");
+    text.push_str(doc_number);
+    text.push_str("\n\n");
+
     for (idx, line) in (1u32..).zip(lines.iter()) {
-        text.push_str(&format!(
-            "{}. {} — {} {} × {} = {} руб.\n",
-            idx,
-            line.name,
-            format_qty_short(line.qty),
-            line.unit,
-            fmt::format_money(line.price),
-            fmt::format_money(line.sum),
-        ));
+        // 1️⃣, 2️⃣, ... — emoji-нумерация 1-9. Для 10+ падаем обратно на «10.»
+        // (вариации эмодзи 10-20 нестабильны на старых ОС).
+        let prefix = match idx {
+            1 => "1️⃣ ",
+            2 => "2️⃣ ",
+            3 => "3️⃣ ",
+            4 => "4️⃣ ",
+            5 => "5️⃣ ",
+            6 => "6️⃣ ",
+            7 => "7️⃣ ",
+            8 => "8️⃣ ",
+            9 => "9️⃣ ",
+            _ => {
+                // Для 10+ — текстовая нумерация «N.».
+                // Вариации эмодзи 1️⃣0️⃣ на старых телефонах рендерятся как два
+                // отдельных символа. Проще откатиться к «N.».
+                text.push_str(&format!("{}. ", idx));
+                ""  // prefix уже записан в text выше
+            }
+        };
+        text.push_str(prefix);
+
+        // Разбиваем наименование на «основное» и «доп. информация».
+        // Доп. информация — это [Бренд] и (Артикул), которые импорт CSV
+        // добавляет в конец наименования. Их переносим на следующую строку.
+        let (main_name, extras) = split_name_and_extras(&line.name);
+        text.push_str(&main_name);
+        text.push('\n');
+
+        // Доп. строка с брендом/артикулом и количеством/ценой.
+        text.push_str("   ");  // отступ 3 пробела
+        if !extras.is_empty() {
+            text.push_str(&extras);
+            text.push_str(" · ");
+        }
+
+        // Количество: для qty=1 — просто «1», для целых — без дробной части.
+        let qty_str = format_qty_for_messenger(line.qty, &line.unit);
+        text.push_str(&qty_str);
+
+        // Цена и сумма.
+        text.push_str(" × ");
+        text.push_str(&fmt::format_money(line.price));
+        text.push_str(" = ");
+        text.push_str(&fmt::format_money(line.sum));
+        text.push_str(" ₽\n");
+
+        // Пустая строка между товарами — визуально разделяет блоки.
+        text.push('\n');
     }
-    text.push('\n');
-    text.push_str(&format!("Итого: {} руб.\n", fmt::format_money(total)));
-    text.push_str(&format!(
-        "Всего наименований {}, на сумму {} руб.\n",
-        n, x
-    ));
+
+    // Подвал — итоги с emoji.
+    text.push_str("💰 Итого: ");
+    text.push_str(&fmt::format_money(total));
+    text.push_str(" ₽\n");
+    text.push_str(&format!("📋 {} наименований\n", n));
     text.push_str(total_words);
     text.push('\n');
+
     text
+}
+
+/// Разбивает полное наименование на основную часть и доп. информацию.
+///
+/// Импорт CSV формирует наименование как «Товар [Бренд] (Артикул)» —
+/// бренд и артикул могут идти в любом порядке (в зависимости от поставщика).
+/// Здесь мы разделяем это на:
+/// - main_name: «Товар» — основное наименование товара
+/// - extras: «Бренд (Артикул)» — доп. информация, переносится на след. строку
+///
+/// Если в наименовании нет [Бренд] или (Артикул), extras будет пустым,
+/// а main_name — полным наименованием.
+fn split_name_and_extras(full_name: &str) -> (String, String) {
+    // Ищем последние [Бренд] и (Артикул) в исходной строке —
+    // независимый поиск по обоим, т.к. порядок может быть любым.
+    let brand = full_name
+        .rfind(']')
+        .and_then(|close| full_name[..close].rfind('['))
+        .map(|open| full_name[open + 1..full_name.rfind(']').unwrap()].trim().to_string())
+        .filter(|b| !b.is_empty());
+
+    let article = full_name
+        .rfind(')')
+        .and_then(|close| full_name[..close].rfind('('))
+        .map(|open| {
+            let close = full_name.rfind(')').unwrap();
+            full_name[open + 1..close].trim().to_string()
+        })
+        .filter(|a| !a.is_empty())
+        .map(|a| format!("({})", a));
+
+    // Убираем [Бренд] и (Артикул) из main_name, даже если они пустые.
+    // Используем replace для «[]» и «()» (пустые скобки) — это нужно,
+    // когда пользователь ввёл «Товар [] ()» — extras будут пустыми,
+    // но скобки не должны остаться в main_name.
+    let mut main = full_name.to_string();
+    if let Some(b) = &brand {
+        main = main.replace(&format!("[{}]", b), "");
+    } else {
+        // Нет бренда — но могут быть пустые [].
+        main = main.replace("[]", "");
+    }
+    if let Some(a) = &article {
+        main = main.replace(a, "");
+    } else {
+        // Нет артикула — но могут быть пустые ().
+        main = main.replace("()", "");
+    }
+    // Схлопываем множественные пробелы в один и тримим концы.
+    let main = main
+        .split_whitespace()
+        .collect::<Vec<&str>>()
+        .join(" ");
+
+    // Собираем extras: «Бренд (Артикул)» или только одно из них.
+    let mut extras_parts: Vec<String> = Vec::new();
+    if let Some(b) = brand {
+        extras_parts.push(b);
+    }
+    if let Some(a) = article {
+        extras_parts.push(a);
+    }
+    let extras = extras_parts.join(" ");
+
+    (main, extras)
+}
+
+/// Форматирует количество для мессенджера: «1» для qty=1 (без «шт»),
+/// «2 шт» для целых штук, «1,500 к-кт» для дробных.
+fn format_qty_for_messenger(qty: f64, unit: &str) -> String {
+    if (qty - 1.0).abs() < 1e-9 {
+        // Для qty=1 не пишем единицу — короче и понятнее.
+        return "1".to_string();
+    }
+    if qty.fract().abs() < 1e-9 {
+        // Целое количество — без дробной части.
+        format!("{} {}", qty as i64, unit)
+    } else {
+        // Дробное — 3 знака после запятой (стандарт для количества).
+        format!("{} {}", format!("{:.3}", qty).replace('.', ","), unit)
+    }
 }
 
 /// Вспомогательная функция: форматирование количества в коротком виде.
@@ -1134,4 +1372,165 @@ fn filled_signature(doc: &Document) -> u64 {
 fn load_draft(path: &std::path::Path) -> Option<Document> {
     let content = std::fs::read_to_string(path).ok()?;
     serde_json::from_str::<Document>(&content).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Тест: split_name_and_extras корректно разбивает «Товар [Бренд] (Артикул)».
+    /// Это формат, который csv_import создаёт в on_close.
+    #[test]
+    fn split_name_extracts_brand_and_article() {
+        let (main, extras) = split_name_and_extras(
+            "Сайлентблок рычага подвески | перед прав/лев | LADA LARGUS [LYNXauto] (C8617)",
+        );
+        assert_eq!(main, "Сайлентблок рычага подвески | перед прав/лев | LADA LARGUS");
+        assert_eq!(extras, "LYNXauto (C8617)");
+    }
+
+    #[test]
+    fn split_name_only_brand_no_article() {
+        let (main, extras) = split_name_and_extras("Фильтр салонный [BM]");
+        assert_eq!(main, "Фильтр салонный");
+        assert_eq!(extras, "BM");
+    }
+
+    #[test]
+    fn split_name_only_article_no_brand() {
+        let (main, extras) = split_name_and_extras("Фильтр масляный (OG313HQ)");
+        assert_eq!(main, "Фильтр масляный");
+        assert_eq!(extras, "(OG313HQ)");
+    }
+
+    #[test]
+    fn split_name_no_extras() {
+        let (main, extras) = split_name_and_extras("Просто наименование товара");
+        assert_eq!(main, "Просто наименование товара");
+        assert_eq!(extras, "");
+    }
+
+    #[test]
+    fn split_name_empty_brackets_ignored() {
+        // Если скобки пустые — extras не должен их включать.
+        let (main, extras) = split_name_and_extras("Товар [] ()");
+        assert_eq!(main, "Товар");
+        assert_eq!(extras, "");
+    }
+
+    /// Тест: format_qty_for_messenger — qty=1 без единицы.
+    #[test]
+    fn qty_one_has_no_unit() {
+        assert_eq!(format_qty_for_messenger(1.0, "шт"), "1");
+        assert_eq!(format_qty_for_messenger(1.0, "к-кт"), "1");
+    }
+
+    /// Тест: целое количество — без дробной части.
+    #[test]
+    fn qty_integer_no_fraction() {
+        assert_eq!(format_qty_for_messenger(2.0, "шт"), "2 шт");
+        assert_eq!(format_qty_for_messenger(8.0, "к-кт"), "8 к-кт");
+    }
+
+    /// Тест: дробное количество — 3 знака после запятой, запятая.
+    #[test]
+    fn qty_fraction_three_decimals() {
+        assert_eq!(format_qty_for_messenger(1.5, "шт"), "1,500 шт");
+        assert_eq!(format_qty_for_messenger(0.5, "к-кт"), "0,500 к-кт");
+    }
+
+    /// Тест: полный формат мессенджера на 3 товарах.
+    /// Проверяем структуру: шапка, нумерация, итоги, прописью.
+    #[test]
+    fn messenger_format_full_structure() {
+        let lines = vec![
+            ChatLineInfo {
+                name: "Товар A [Brand1] (Art1)".to_string(),
+                qty: 2.0,
+                unit: "шт".to_string(),
+                price: 100.0,
+                sum: 200.0,
+            },
+            ChatLineInfo {
+                name: "Товар B [Brand2] (Art2)".to_string(),
+                qty: 1.0,
+                unit: "шт".to_string(),
+                price: 500.0,
+                sum: 500.0,
+            },
+            ChatLineInfo {
+                name: "Товар C".to_string(),
+                qty: 1.0,
+                unit: "к-кт".to_string(),
+                price: 50.0,
+                sum: 50.0,
+            },
+        ];
+        let text = format_lines_for_messenger(
+            &lines,
+            "DZHOД123456",
+            750.0,
+            "Семьсот пятьдесят рублей 00 копеек",
+            3,
+        );
+
+        // Шапка с номером заявки.
+        assert!(text.contains("🛒 Заявка № DZHOД123456"), "должна быть шапка");
+
+        // Нумерация 1️⃣, 2️⃣, 3️⃣.
+        assert!(text.contains("1️⃣"), "должна быть 1️⃣");
+        assert!(text.contains("2️⃣"), "должна быть 2️⃣");
+        assert!(text.contains("3️⃣"), "должна быть 3️⃣");
+
+        // Бренд и артикул на отдельной строке (с отступом).
+        assert!(text.contains("   Brand1 (Art1)"), "бренд и артикул должны быть с отступом");
+
+        // Для qty=1 не пишем «шт».
+        // «1 × 500» для второго товара (qty=1, нет «шт»).
+        assert!(text.contains("1 × 500,00 = 500,00 ₽"), "qty=1 без ед.");
+
+        // Для qty=2 — «2 шт».
+        assert!(text.contains("2 шт × 100,00 = 200,00 ₽"), "qty=2 с ед.");
+
+        // Подвал — итоги с emoji.
+        assert!(text.contains("💰 Итого: 750,00 ₽"), "должен быть итог");
+        assert!(text.contains("📋 3 наименований"), "должно быть количество");
+        assert!(
+            text.contains("Семьсот пятьдесят рублей 00 копеек"),
+            "должна быть прописью"
+        );
+    }
+
+    /// Тест: 10+ товаров падает обратно на текстовую нумерацию (без emoji),
+    /// потому что «1️⃣0️⃣» на старых телефонах рендерится как два символа.
+    #[test]
+    fn messenger_format_10_plus_uses_text_numbers() {
+        let mut lines = Vec::new();
+        // Создаём 11 товаров. После нумерации 1..11: 1️⃣...9️⃣ для 1-9,
+        // «10.» для 10-го, «11.» для 11-го.
+        for i in 0..11 {
+            lines.push(ChatLineInfo {
+                name: format!("Товар {}", i),
+                qty: 1.0,
+                unit: "шт".to_string(),
+                price: 100.0,
+                sum: 100.0,
+            });
+        }
+        let text = format_lines_for_messenger(
+            &lines,
+            "DZHOД123456",
+            1100.0,
+            "Одна тысяча сто рублей 00 копеек",
+            11,
+        );
+
+        // 10-й по порядку товар (индекс 9 в lines) должен использовать «10.»
+        // а не «1️⃣0️⃣».
+        assert!(
+            text.contains("10. Товар 9"),
+            "10+ должен быть с точкой, не emoji. Текст:\n{}",
+            text
+        );
+    }
 }
