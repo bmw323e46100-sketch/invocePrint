@@ -1579,6 +1579,18 @@ pub mod gui {
     pub const WINDOW_WIDTH: f32 = 950.0;
     pub const WINDOW_HEIGHT: f32 = 720.0;
 
+    /// Кэш рассчитанных итогов. Пересчитывается только если изменился
+    /// `filled_signature` документа — это убирает ~5 аллокаций (format_money,
+    /// format_rubles_rounded, amount_to_words и т.д.) на каждый кадр egui.
+    struct TotalsCache {
+        signature: u64,
+        total_str: String,
+        n_items: usize,
+        rubles_rounded_str: String,
+        total_words: String,
+        cash_str: String,
+    }
+
     /// Состояние приложения.
     pub struct App {
         pub doc: Document,
@@ -1588,14 +1600,16 @@ pub mod gui {
         pub status_message: String,
         pub last_filled_signature: u64,
         pub show_new_doc_dialog: bool,
-        /// Окно истории распечаток.
         pub show_history_window: bool,
-        /// Кэш списка истории (обновляется при открытии окна).
         pub history_entries: Vec<HistoryEntry>,
-        /// Индекс выбранной записи в истории (для просмотра деталей).
         pub history_selected: Option<usize>,
-        /// Флаг тёмной темы (true = тёмная, false = светлая).
         pub dark_theme: bool,
+        /// Кэш заголовка окна — не дёргаем ViewportCommand::Title каждый кадр.
+        last_title: String,
+        /// Кэш применённой темы — не вызываем set_visuals каждый кадр.
+        last_dark_theme: Option<bool>,
+        /// Кэш рассчитанных итогов. None = инвалидирован.
+        totals_cache: Option<TotalsCache>,
     }
 
     impl App {
@@ -1612,6 +1626,7 @@ pub mod gui {
             doc.date = fmt::today_string();
 
             let last_filled_signature = filled_signature(&doc);
+            let initial_title = format!("Заявка на отгрузку № {} — {}", doc.number, APP_NAME);
             Self {
                 doc,
                 draft_path,
@@ -1624,6 +1639,9 @@ pub mod gui {
                 history_entries: Vec::new(),
                 history_selected: None,
                 dark_theme: false,
+                last_title: initial_title,
+                last_dark_theme: None,
+                totals_cache: None,
             }
         }
 
@@ -1633,13 +1651,39 @@ pub mod gui {
             self.apply_theme(ctx);
         }
 
-        /// Применяет текущую тему к egui-контексту.
+        /// Применяет текущую тему. ВАЖНО: вызывать только при переключении
+        /// темы — не каждый кадр. На Windows повторный set_visuals
+        /// пересоздаёт стиль и слегка дёргает интерфейс.
         pub fn apply_theme(&self, ctx: &egui::Context) {
             if self.dark_theme {
                 ctx.set_visuals(egui::Visuals::dark());
             } else {
                 ctx.set_visuals(egui::Visuals::light());
             }
+        }
+
+        /// Возвращает кэш итогов документа. Пересчитывает только если
+        /// изменился `filled_signature`. Раньше: каждый кадр egui (~60 FPS)
+        /// вызывал doc.total() + format_money + amount_to_words (~8 аллокаций).
+        fn totals(&mut self) -> &TotalsCache {
+            let sig = filled_signature(&self.doc);
+            let needs_rebuild = self
+                .totals_cache
+                .as_ref()
+                .map_or(true, |c| c.signature != sig);
+            if needs_rebuild {
+                let total = self.doc.total();
+                let n = self.doc.filled_count();
+                self.totals_cache = Some(TotalsCache {
+                    signature: sig,
+                    total_str: fmt::format_money(total),
+                    n_items: n,
+                    rubles_rounded_str: fmt::format_rubles_rounded(total),
+                    total_words: crate::money_words::amount_to_words(total),
+                    cash_str: fmt::format_money(total),
+                });
+            }
+            self.totals_cache.as_ref().unwrap()
         }
 
         pub fn save_draft(&self) {
@@ -1659,6 +1703,7 @@ pub mod gui {
                 lines: vec![LineItem::empty()],
             };
             self.last_filled_signature = 0;
+            self.totals_cache = None;
             self.status_message = "Создана новая заявка".to_string();
             self.save_draft();
         }
@@ -1817,11 +1862,22 @@ pub mod gui {
         }
 
         fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-            // Применяем тему каждый кадр — гарантирует, что тема не «слетит».
-            self.apply_theme(ui.ctx());
+            let ctx = ui.ctx().clone();
 
+            // Тему применяем только при изменении флага dark_theme — не каждый кадр.
+            // Тема не «слетает» сама, egui хранит её в ctx.
+            if self.last_dark_theme != Some(self.dark_theme) {
+                self.apply_theme(&ctx);
+                self.last_dark_theme = Some(self.dark_theme);
+            }
+
+            // Заголовок окна обновляем только при изменении — частый
+            // send_viewport_cmd(Title) перегружает оконную систему на Windows.
             let title = format!("Заявка на отгрузку № {} — {}", self.doc.number, APP_NAME);
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Title(title));
+            if self.last_title != title {
+                self.last_title = title.clone();
+                ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+            }
 
             if self.show_new_doc_dialog {
                 let mut open = true;
@@ -2022,13 +2078,15 @@ pub mod gui {
             });
         }
 
-        fn render_totals(&self, ui: &mut egui::Ui) {
+        fn render_totals(&mut self, ui: &mut egui::Ui) {
             ui.add_space(4.0);
-            let total = self.doc.total();
-            let n = self.doc.filled_count();
-            let x = fmt::format_rubles_rounded(total);
-            let words = crate::money_words::amount_to_words(total);
-            let cash = fmt::format_money(total);
+            // Кэш итогов — пересчёт только при изменении signature.
+            let totals = self.totals();
+            let total_str = totals.total_str.clone();
+            let n_items = totals.n_items;
+            let rubles_rounded = totals.rubles_rounded_str.clone();
+            let words = totals.total_words.clone();
+            let cash = totals.cash_str.clone();
 
             egui::Grid::new("totals_grid")
                 .num_columns(2)
@@ -2036,11 +2094,11 @@ pub mod gui {
                 .min_col_width(140.0)
                 .show(ui, |ui| {
                     ui.strong("Итого:");
-                    ui.label(fmt::format_money(total));
+                    ui.label(total_str);
                     ui.end_row();
 
                     ui.strong("Всего наименований:");
-                    ui.label(format!("{}, на сумму {} руб.", n, x));
+                    ui.label(format!("{}, на сумму {} руб.", n_items, rubles_rounded));
                     ui.end_row();
 
                     ui.strong("Сумма прописью:");
@@ -2127,10 +2185,20 @@ pub mod gui {
             self.history_selected = new_selection;
 
             // Детали выбранной записи.
+            //
+            // Раньше: entry.clone() каждый кадр — клонировали всю запись,
+            // включая Vec<HistoryItem> (десятки аллокаций на больших историях).
+            // Причина клона: внутри блока было `self.history_entries = store.list()`
+            // (после удаления), что конфликтует с заимствованием entry.
+            //
+            // Теперь: собираем «отложенные действия» в Option-переменные,
+            // освобождаем borrow после show(), затем выполняем действия.
+            let mut open_pdf_request: Option<String> = None;
+            let mut delete_request: Option<(String, String)> = None;
+
             egui::CentralPanel::default().show(ui, |ui| {
                 if let Some(idx) = self.history_selected {
                     if let Some(entry) = self.history_entries.get(idx) {
-                        let entry_clone = entry.clone();
                         ui.heading(format!("Заявка № {}", entry.number));
                         ui.add_space(4.0);
                         egui::Grid::new("history_detail_grid")
@@ -2164,6 +2232,7 @@ pub mod gui {
                         ui.heading("Строки товаров:");
                         ui.separator();
 
+                        let items = &entry.items;
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             egui::Grid::new("history_items_grid")
                                 .num_columns(6)
@@ -2177,7 +2246,7 @@ pub mod gui {
                                     ui.strong("цена");
                                     ui.strong("сумма");
                                     ui.end_row();
-                                    for item in &entry_clone.items {
+                                    for item in items {
                                         ui.label(item.index.to_string());
                                         ui.label(&item.name);
                                         ui.label(format_qty_short(item.qty));
@@ -2191,22 +2260,14 @@ pub mod gui {
 
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
-                            if let Some(pdf) = &entry_clone.pdf_path {
+                            if let Some(pdf) = &entry.pdf_path {
                                 if ui.button("Открыть PDF").clicked() {
-                                    let _ = open::that(pdf);
+                                    open_pdf_request = Some(pdf.clone());
                                 }
                             }
                             if ui.button("Удалить из истории").clicked() {
-                                let store = HistoryStore::new(self.history_dir.clone());
-                                match store.delete(&entry_clone.number, &entry_clone.timestamp) {
-                                    Ok(()) => {
-                                        self.history_entries = store.list();
-                                        self.history_selected = None;
-                                    }
-                                    Err(e) => {
-                                        eprintln!("Не удалось удалить: {}", e);
-                                    }
-                                }
+                                delete_request =
+                                    Some((entry.number.clone(), entry.timestamp.clone()));
                             }
                         });
                     } else {
@@ -2219,6 +2280,23 @@ pub mod gui {
                     });
                 }
             });
+
+            // Выполняем отложенные действия после освобождения borrow.
+            if let Some(pdf_path) = open_pdf_request {
+                let _ = open::that(&pdf_path);
+            }
+            if let Some((number, timestamp)) = delete_request {
+                let store = HistoryStore::new(self.history_dir.clone());
+                match store.delete(&number, &timestamp) {
+                    Ok(()) => {
+                        self.history_entries = store.list();
+                        self.history_selected = None;
+                    }
+                    Err(e) => {
+                        eprintln!("Не удалось удалить: {}", e);
+                    }
+                }
+            }
         }
     }
 
