@@ -76,19 +76,30 @@ impl HistoryEntry {
     /// Формат: «Заявка DZHOД123456 2026-10-06 15-30-45.ron»
     /// (с временной меткой, чтобы избежать коллизий имён).
     pub fn ron_filename(&self) -> String {
-        // Извлекаем дату-время из timestamp для имени файла.
-        let safe_ts = self
-            .timestamp
-            .chars()
-            .map(|c| match c {
-                ':' | ' ' | 'T' => '-',
-                '+' => 'p',
-                '.' => '-',
-                _ => c,
-            })
-            .collect::<String>();
-        format!("Заявка {} {}.ron", self.number, safe_ts)
+        ron_filename_for(&self.number, &self.timestamp)
     }
+}
+
+/// Вынесенная логика построения имени RON-файла по (number, timestamp).
+///
+/// Имя файла детерминированно кодирует оба поля, поэтому для удаления
+/// записи по (number, timestamp) можно собрать имя напрямую и удалить
+/// файл — без чтения и парсинга всех файлов истории.
+///
+/// Раньше `HistoryStore::delete` делал O(n) чтений и RON-десериализаций
+/// ради одной записи. Теперь — O(1) один `remove_file`.
+fn ron_filename_for(number: &str, timestamp: &str) -> String {
+    // Та же трансформация символов, что и в HistoryEntry::ron_filename.
+    let safe_ts = timestamp
+        .chars()
+        .map(|c| match c {
+            ':' | ' ' | 'T' => '-',
+            '+' => 'p',
+            '.' => '-',
+            _ => c,
+        })
+        .collect::<String>();
+    format!("Заявка {} {}.ron", number, safe_ts)
 }
 
 /// Менеджер истории: загрузка, сохранение, список.
@@ -144,25 +155,28 @@ impl HistoryStore {
     }
 
     /// Удаляет запись истории по её номеру и timestamp.
+    ///
+    /// Раньше: O(n) чтений и RON-десериализаций (читали все файлы, парсили,
+    /// сравнивали). На истории из 500 записей это 500 чтений с диска и
+    /// 500 парсингов RON — заметно при каждом удалении.
+    ///
+    /// Теперь: O(1). Имя файла детерминированно строится из (number, timestamp)
+    /// через `ron_filename_for` — собираем путь напрямую и вызываем
+    /// `remove_file`. Никакого чтения или парсинга.
+    ///
+    /// Гарантия корректности: `ron_filename` вызывается при `save()` и
+    /// `delete()` с одной и той же логикой трансформации, поэтому имя файла
+    /// совпадает. Если файл не найден или не удалился — возвращаем ошибку.
     pub fn delete(&self, number: &str, timestamp: &str) -> Result<(), String> {
-        if let Ok(rd) = std::fs::read_dir(&self.dir) {
-            for entry in rd.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("ron") {
-                    continue;
-                }
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    if let Ok(hist) = ron::from_str::<HistoryEntry>(&content) {
-                        if hist.number == number && hist.timestamp == timestamp {
-                            std::fs::remove_file(&path)
-                                .map_err(|e| format!("Не удалось удалить: {}", e))?;
-                            return Ok(());
-                        }
-                    }
-                }
+        let filename = ron_filename_for(number, timestamp);
+        let path = self.dir.join(&filename);
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(format!("Запись не найдена: {}", path.display()))
             }
+            Err(e) => Err(format!("Не удалось удалить {}: {}", path.display(), e)),
         }
-        Err("Запись не найдена".to_string())
     }
 }
 
@@ -290,6 +304,69 @@ mod tests {
         assert_eq!(list[0].number, "DZHOД000002");
         assert_eq!(list[1].number, "DZHOД000003");
         assert_eq!(list[2].number, "DZHOД000001");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Тест на O(1) удаление: при 100 записях в истории удаление одной
+    /// не должно читать/парсить остальные. Косвенное доказательство:
+    /// создаём 100 записей, удаляем одну, и проверяем, что:
+    /// 1. Удаление прошло успешно.
+    /// 2. Осталось ровно 99 записей.
+    /// 3. Удаление записи с несуществующим timestamp возвращает ошибку
+    ///    «Запись не найдена» — без паники.
+    #[test]
+    fn delete_with_large_history() {
+        let tmp = std::env::temp_dir().join("zayavka_history_test_large");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = HistoryStore::new(tmp.clone());
+
+        // Создаём 100 записей с разными номерами и timestamp.
+        let mut entries = Vec::new();
+        for i in 0..100 {
+            let mut entry = HistoryEntry::from_document(&make_doc(), None);
+            entry.number = format!("DZHOД{:06}", i);
+            entry.timestamp = format!("2026-10-{:02}T10:00:00+00:00", i + 1);
+            entries.push(entry);
+        }
+        for entry in &entries {
+            let _ = store.save(entry).expect("save failed");
+        }
+        assert_eq!(store.list().len(), 100);
+
+        // Удаляем 50-ю запись.
+        let target = &entries[50];
+        let t = std::time::Instant::now();
+        store
+            .delete(&target.number, &target.timestamp)
+            .expect("delete failed");
+        let elapsed = t.elapsed();
+        // O(1) удаление должно быть намного быстрее, чем чтение 100 RON-файлов.
+        // На CI это может быть медленнее, поэтому宽松ный лимит 1 секунда.
+        assert!(
+            elapsed.as_millis() < 1000,
+            "Удаление заняло {:?} — ожидалось < 1с для O(1)",
+            elapsed
+        );
+
+        // Проверяем, что осталось 99.
+        assert_eq!(store.list().len(), 99);
+
+        // Проверяем, что удалённая запись действительно исчезла.
+        let list = store.list();
+        assert!(!list
+            .iter()
+            .any(|e| e.number == target.number && e.timestamp == target.timestamp));
+
+        // Удаление несуществующей записи должно вернуть ошибку.
+        let result = store.delete("DZHOД999999", "2026-10-01T10:00:00+00:00");
+        assert!(result.is_err(), "Ожидалась ошибка для несуществующей записи");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("не найден") || err.contains("не найдена"),
+            "Сообщение об ошибке должно упоминать «не найден»: {}",
+            err
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
