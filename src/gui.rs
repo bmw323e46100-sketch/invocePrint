@@ -1,7 +1,7 @@
 //! Модуль графического интерфейса на egui/eframe.
 
 use crate::fmt;
-use crate::history::{HistoryEntry, HistoryStore};
+use crate::history::{HistoryEntry, HistoryItem, HistoryStore};
 use crate::model::{self, Document, LineItem, Unit};
 use crate::pdf;
 use crate::APP_NAME;
@@ -49,6 +49,13 @@ pub struct App {
     last_change: Option<std::time::Instant>,
     /// Флаг: идёт генерация PDF в фоновом потоке.
     pdf_in_progress: bool,
+    /// Стек предыдущих состояний документа для Undo (Ctrl+Z).
+    /// Максимум 50 снимков — больше не нужно, экономит память.
+    pub undo_stack: Vec<Vec<LineItem>>,
+    /// Показывать окно ввода процента наценки.
+    pub show_markup_dialog: bool,
+    /// Текущее значение процента наценки в окне (строка, парсится в f64).
+    pub markup_input: String,
     /// Канал для получения результата фоновой генерации PDF.
     pdf_result_rx: Option<std::sync::mpsc::Receiver<PdfResult>>,
 }
@@ -92,6 +99,9 @@ impl App {
             dirty: false,
             last_change: None,
             pdf_in_progress: false,
+            undo_stack: Vec::new(),
+            show_markup_dialog: false,
+            markup_input: "10".to_string(),
             pdf_result_rx: None,
         }
     }
@@ -100,6 +110,58 @@ impl App {
     pub fn toggle_theme(&mut self, ctx: &egui::Context) {
         self.dark_theme = !self.dark_theme;
         self.apply_theme(ctx);
+    }
+
+    /// Сохраняет снимок строк в стек Undo перед изменяющим действием.
+    /// Стек ограничен 50 снимками — этого достаточно для типичной сессии
+    /// и не даёт памяти расти бесконечно.
+    fn push_undo(&mut self) {
+        const MAX_UNDO: usize = 50;
+        if self.undo_stack.len() >= MAX_UNDO {
+            self.undo_stack.remove(0);
+        }
+        self.undo_stack.push(self.doc.lines.clone());
+    }
+
+    /// Откат последнего действия. Достаёт снимок из стека и восстанавливает.
+    /// Если стек пуст — сообщает «Нечего отменять».
+    fn undo(&mut self) {
+        if let Some(prev_lines) = self.undo_stack.pop() {
+            self.doc.lines = prev_lines;
+            // totals_cache инвалидируется через filled_signature
+            // (он проверяется в totals() при следующем вызове).
+            self.totals_cache = None;
+            self.status_message = "Действие отменено (Ctrl+Z)".to_string();
+            if self.doc.lines.is_empty() {
+                self.doc.lines.push(LineItem::empty());
+            }
+            // Undo — это изменение, помечаем как dirty (debounce сработает).
+            self.mark_dirty();
+        } else {
+            self.status_message = "Нечего отменять".to_string();
+        }
+    }
+
+    /// Применяет процент наценки ко всем строкам с ценой.
+    /// Округляет до копеек (×100, round, /100). Undo доступно.
+    /// Например, percent=10 увеличивает все цены на 10%.
+    fn apply_markup(&mut self, percent: f64) {
+        self.push_undo();
+        let multiplier = 1.0 + percent / 100.0;
+        let mut affected = 0usize;
+        for line in &mut self.doc.lines {
+            if let Some(price) = line.price_value() {
+                let new_price = (price * multiplier * 100.0).round() / 100.0;
+                line.price = format!("{:.2}", new_price);
+                affected += 1;
+            }
+        }
+        self.totals_cache = None;  // суммы строк изменились
+        self.mark_dirty();
+        self.status_message = format!(
+            "Наценка {}% применена к {} строкам",
+            percent, affected
+        );
     }
 
     /// Применяет текущую тему. ВАЖНО: вызывать только при переключении
@@ -205,6 +267,7 @@ impl App {
     }
 
     fn new_document(&mut self) {
+        self.push_undo();  // сохранить текущее состояние перед очисткой
         self.doc = Document {
             number: model::generate_number(),
             date: fmt::today_string(),
@@ -270,11 +333,13 @@ impl App {
     }
 
     fn add_empty_line(&mut self) {
+        self.push_undo();
         self.doc.lines.push(LineItem::empty());
     }
 
     fn remove_line(&mut self, idx: usize) {
         if idx < self.doc.lines.len() {
+            self.push_undo();
             self.doc.lines.remove(idx);
             if self.doc.lines.is_empty() {
                 self.doc.lines.push(LineItem::empty());
@@ -300,6 +365,7 @@ impl App {
                     return;
                 }
                 // Добавляем импортированные строки к существующим.
+                self.push_undo();
                 while let Some(last) = self.doc.lines.last() {
                     if !last.is_filled() {
                         self.doc.lines.pop();
@@ -323,46 +389,60 @@ impl App {
         }
     }
 
-    /// Копирует текст заявки в буфер обмена — для отправки в Telegram,
-    /// мессенджеры или email. Формат: только список товаров + итоги
-    /// (без шапки с номером заявки и поставщиком — по запросу пользователя).
+    /// Копирует текст заявки в буфер обмена — для отправки в Telegram.
+    /// Использует общую функцию format_lines_for_chat, чтобы переиспользовать
+    /// код с копированием записи из истории.
     fn copy_to_clipboard(&mut self, ctx: &egui::Context) {
         let total = self.doc.total();
-        let total_str = fmt::format_money(total);
         let total_words = crate::money_words::amount_to_words(total);
         let n = self.doc.filled_count();
         let x = fmt::format_rubles_rounded(total);
 
-        let mut text = String::new();
+        let chat_lines: Vec<ChatLineInfo> = self
+            .doc
+            .filled_lines()
+            .into_iter()
+            .map(|line| ChatLineInfo {
+                name: line.name.clone(),
+                qty: line.qty_value().unwrap_or(0.0),
+                unit: line.unit.as_str().to_string(),
+                price: line.price_value().unwrap_or(0.0),
+                sum: line.sum_value().unwrap_or(0.0),
+            })
+            .collect();
 
-        // Список товаров — без шапки, сразу нумерованный список.
-        for (idx, line) in (1u32..).zip(self.doc.filled_lines()) {
-            let qty = line.qty_value().unwrap_or(0.0);
-            let price = line.price_value().unwrap_or(0.0);
-            let sum = line.sum_value().unwrap_or(0.0);
-            text.push_str(&format!(
-                "{}. {} — {} {} × {} = {} руб.\n",
-                idx,
-                line.name,
-                format_qty_short(qty),
-                line.unit.as_str(),
-                fmt::format_money(price),
-                fmt::format_money(sum),
-            ));
-        }
-
-        text.push('\n');
-        text.push_str(&format!("Итого: {} руб.\n", total_str));
-        text.push_str(&format!(
-            "Всего наименований {}, на сумму {} руб.\n",
-            n, x
-        ));
-        text.push_str(&format!("{}\n", total_words));
-
+        let text = format_lines_for_chat(&chat_lines, total, &total_words, n, x);
         ctx.copy_text(text);
         self.status_message =
             "Заявка скопирована в буфер обмена — можно вставить в Telegram"
                 .to_string();
+    }
+
+    /// Копирует выбранную запись из истории в буфер обмена.
+    /// Использует ту же функцию format_lines_for_chat, что и copy_to_clipboard.
+    fn copy_history_to_clipboard(
+        &mut self,
+        ctx: &egui::Context,
+        items: &[HistoryItem],
+        total: f64,
+        total_words: &str,
+        n: usize,
+    ) {
+        let x = fmt::format_rubles_rounded(total);
+        let chat_lines: Vec<ChatLineInfo> = items
+            .iter()
+            .map(|item| ChatLineInfo {
+                name: item.name.clone(),
+                qty: item.qty,
+                unit: item.unit.clone(),
+                price: item.price,
+                sum: item.sum,
+            })
+            .collect();
+        let text = format_lines_for_chat(&chat_lines, total, total_words, n, x);
+        ctx.copy_text(text);
+        self.status_message =
+            "Запись из истории скопирована в буфер обмена".to_string();
     }
 
     fn ensure_trailing_empty(&mut self) {
@@ -452,6 +532,20 @@ impl eframe::App for App {
             }
         });
 
+        // Ctrl+Z — откат последнего действия.
+        // ВАЖНО: проверяем egui_wants_keyboard_input() — если фокус в TextEdit
+        // (например, пользователь вводит имя товара), Ctrl+Z должен работать
+        // как undo текста внутри TextEdit, а не как наш undo документа.
+        // egui_wants_keyboard_input возвращает true, когда TextEdit «захватил»
+        // ввод — в этом случае мы не перехватываем Ctrl+Z.
+        let undo_pressed = ctx.input(|i| {
+            i.key_pressed(egui::Key::Z)
+                && (i.modifiers.ctrl || i.modifiers.command)
+        });
+        if undo_pressed && !ctx.egui_wants_keyboard_input() {
+            self.undo();
+        }
+
         if self.show_new_doc_dialog {
             let mut open = true;
             egui::Window::new("Новая заявка")
@@ -493,6 +587,53 @@ impl eframe::App for App {
             }
         }
 
+        // Окно ввода процента наценки.
+        // Открывается по кнопке «Наценка %» в тулбаре. Применяет процент
+        // ко всем строкам с ценой, округляя до копеек. Undo доступно через
+        // push_undo() внутри apply_markup.
+        if self.show_markup_dialog {
+            let mut open = true;
+            egui::Window::new("Наценка на все товары")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .show(ui, |ui| {
+                    ui.label("Введите процент наценки (10 = +10% к цене):");
+                    ui.add_space(4.0);
+                    ui.text_edit_singleline(&mut self.markup_input);
+                    ui.add_space(4.0);
+                    ui.label("Цены всех строк будут увеличены. Undo: Ctrl+Z.");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Применить").clicked() {
+                            // Нормализуем ввод: убираем пробелы, запятую → точка.
+                            let cleaned: String = self
+                                .markup_input
+                                .chars()
+                                .filter(|c| !c.is_whitespace())
+                                .map(|c| if c == ',' { '.' } else { c })
+                                .collect();
+                            match cleaned.parse::<f64>() {
+                                Ok(p) => {
+                                    self.apply_markup(p);
+                                    self.show_markup_dialog = false;
+                                }
+                                Err(_) => {
+                                    self.status_message =
+                                        "Некорректный процент".to_string();
+                                }
+                            }
+                        }
+                        if ui.button("Отмена").clicked() {
+                            self.show_markup_dialog = false;
+                        }
+                    });
+                });
+            if !open {
+                self.show_markup_dialog = false;
+            }
+        }
+
         egui::Panel::bottom("status_bar").show(ui, |ui| {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
@@ -523,6 +664,9 @@ impl eframe::App for App {
                 if ui.button("+ Добавить строку").clicked() {
                     self.add_empty_line();
                 }
+                if ui.button("Отменить (Ctrl+Z)").clicked() {
+                    self.undo();
+                }
                 ui.separator();
                 // Импорт только из буфера обмена — без файлового диалога.
                 if ui.button("Вставить из буфера").clicked() {
@@ -531,6 +675,11 @@ impl eframe::App for App {
                 ui.separator();
                 if ui.button("Копировать текст").clicked() {
                     self.copy_to_clipboard(ui.ctx());
+                }
+                ui.separator();
+                // Наценка на все товары — открывает диалог ввода процента.
+                if ui.button("Наценка %").clicked() {
+                    self.show_markup_dialog = true;
                 }
                 ui.separator();
                 // Кнопка истории — текст, не эмодзи (егui не рендерит эмодзи).
@@ -780,6 +929,10 @@ impl App {
         // освобождаем borrow после show(), затем выполняем действия.
         let mut open_pdf_request: Option<String> = None;
         let mut delete_request: Option<(String, String)> = None;
+        // (items, total, total_words, items_count) — нужно для копирования
+        // записи из истории в буфер обмена. Clone items — это компромисс:
+        // он копирует Vec<HistoryItem>, но только при клике пользователя.
+        let mut copy_history_request: Option<(Vec<HistoryItem>, f64, String, usize)> = None;
 
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(idx) = self.history_selected {
@@ -850,6 +1003,17 @@ impl App {
                                 open_pdf_request = Some(pdf.clone());
                             }
                         }
+                        // Кнопка копирования заявки из истории в буфер обмена.
+                        // Полезно, когда нужно переотправить старую заявку в Telegram
+                        // без повторного ввода товаров.
+                        if ui.button("Скопировать в чат").clicked() {
+                            copy_history_request = Some((
+                                entry.items.clone(),
+                                entry.total,
+                                entry.total_words.clone(),
+                                entry.items_count,
+                            ));
+                        }
                         if ui.button("Удалить из истории").clicked() {
                             delete_request =
                                 Some((entry.number.clone(), entry.timestamp.clone()));
@@ -882,7 +1046,67 @@ impl App {
                 }
             }
         }
+        if let Some((items, total, total_words, n)) = copy_history_request {
+            // Нужен клон ctx, т.к. borrow на ui ещё активен.
+            let ctx = ui.ctx().clone();
+            self.copy_history_to_clipboard(&ctx, &items, total, &total_words, n);
+        }
     }
+}
+
+/// Унифицированная информация о строке товара для копирования в чат.
+///
+/// Нужна, чтобы copy_to_clipboard (для текущего документа) и
+/// copy_history_to_clipboard (для записи из истории) использовали одну
+/// функцию форматирования. LineItem и HistoryItem имеют разные поля
+/// (String vs f64), но обе приводятся к этому общему типу.
+struct ChatLineInfo {
+    name: String,
+    qty: f64,
+    unit: String,
+    price: f64,
+    sum: f64,
+}
+
+/// Форматирует список товаров в текст для отправки в мессенджер.
+///
+/// Формат:
+/// ```text
+/// 1. Товар A — 2 шт × 100,00 = 200,00 руб.
+/// 2. Товар B — 1 к-кт × 500,00 = 500,00 руб.
+///
+/// Итого: 700,00 руб.
+/// Всего наименований 2, на сумму 700 руб.
+/// Семьсот рублей 00 копеек
+/// ```
+fn format_lines_for_chat(
+    lines: &[ChatLineInfo],
+    total: f64,
+    total_words: &str,
+    n: usize,
+    x: String,
+) -> String {
+    let mut text = String::new();
+    for (idx, line) in (1u32..).zip(lines.iter()) {
+        text.push_str(&format!(
+            "{}. {} — {} {} × {} = {} руб.\n",
+            idx,
+            line.name,
+            format_qty_short(line.qty),
+            line.unit,
+            fmt::format_money(line.price),
+            fmt::format_money(line.sum),
+        ));
+    }
+    text.push('\n');
+    text.push_str(&format!("Итого: {} руб.\n", fmt::format_money(total)));
+    text.push_str(&format!(
+        "Всего наименований {}, на сумму {} руб.\n",
+        n, x
+    ));
+    text.push_str(total_words);
+    text.push('\n');
+    text
 }
 
 /// Вспомогательная функция: форматирование количества в коротком виде.
