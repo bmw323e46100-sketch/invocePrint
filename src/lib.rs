@@ -1165,33 +1165,48 @@ pub mod pdf {
     // Фильтрация неподдерживаемых символов
     // ============================================================================
 
-    // Thread-local кэш распарсенного шрифта. Face парсится один раз на поток,
-    // потом используется для проверки отдельных символов через `glyph_index`.
-    // `glyph_index` очень быстрый (O(log n) в cmap), поэтому фильтрация
-    // строк не создаёт накладных расходов.
-    thread_local! {
-        static FONT_FACE: std::cell::RefCell<Option<ttf_parser::Face<'static>>> = const {
-            std::cell::RefCell::new(None)
-        };
+    // Глобальный bitmap всех codepoint-ов, поддерживаемых шрифтом DejaVu Serif.
+    //
+    // Раньше: thread_local<RefCell<Option<Face>>> + glyph_index(c) на каждый
+    // символ — O(log n) cmap lookup + BorrowMut на каждый чар.
+    // Теперь: один раз парсим Face, обходим cmap subtables через codepoints()
+    // callback, заполняем HashSet. После инициализации contains() — O(1).
+    //
+    // Используем std::sync::OnceLock (стабилен с Rust 1.70). Управляющие
+    // символы \n \r \t в cmap не входят, но мы их пропускаем явно.
+    static SUPPORTED_CODEPOINTS: std::sync::OnceLock<std::collections::HashSet<u32>> =
+        std::sync::OnceLock::new();
+
+    /// Возвращает ссылку на глобальный bitmap поддерживаемых символов.
+    /// Парсит шрифт один раз при первом обращении (через `OnceLock`).
+    fn supported_codepoints() -> &'static std::collections::HashSet<u32> {
+        SUPPORTED_CODEPOINTS.get_or_init(|| {
+            let mut set = std::collections::HashSet::with_capacity(4096);
+            match ttf_parser::Face::parse(FONT_REGULAR, 0) {
+                Ok(face) => {
+                    if let Some(cmap) = face.tables().cmap {
+                        for subtable in cmap.subtables {
+                            subtable.codepoints(|cp| {
+                                set.insert(cp);
+                            });
+                        }
+                    }
+                    set.insert('\n' as u32);
+                    set.insert('\r' as u32);
+                    set.insert('\t' as u32);
+                    set
+                }
+                Err(_) => set,
+            }
+        })
     }
 
     /// Проверяет, поддерживает ли шрифт данный символ.
     fn is_char_supported(c: char) -> bool {
-        // Управляющие символы всегда пропускаем.
         if c == '\n' || c == '\r' || c == '\t' {
             return true;
         }
-        FONT_FACE.with(|cell| {
-            let mut borrowed = cell.borrow_mut();
-            if borrowed.is_none() {
-                *borrowed = ttf_parser::Face::parse(FONT_REGULAR, 0).ok();
-            }
-            if let Some(face) = borrowed.as_ref() {
-                face.glyph_index(c).is_some()
-            } else {
-                false
-            }
-        })
+        supported_codepoints().contains(&(c as u32))
     }
 
     /// Фильтрует строку, удаляя символы, которых нет в шрифте.
@@ -1263,14 +1278,34 @@ pub mod pdf {
     }
 
     fn load_font_family() -> Result<genpdf::fonts::FontFamily<genpdf::fonts::FontData>, genpdf::error::Error> {
-        let regular = genpdf::fonts::FontData::new(FONT_REGULAR.to_vec(), None)?;
-        let bold = genpdf::fonts::FontData::new(FONT_BOLD.to_vec(), None)?;
-        let regular_italic = regular.clone();
-        let bold_italic = bold.clone();
+        // Кэш FontData через OnceLock. Раньше каждый generate_pdf парсил
+        // TTF заново (2 × ~700 КБ аллокаций). Теперь парсим один раз
+        // за весь процесс и клонируем только FontData (содержит Arc для raw_data).
+        //
+        // get_or_try_init требует unstable once_cell_try, поэтому get_or_init
+        // с .expect() — шрифт вшит в бинарник через include_bytes!, так что
+        // panic внутри означает compile-time проблему с вшитыми данными.
+        static REGULAR: std::sync::OnceLock<genpdf::fonts::FontData> =
+            std::sync::OnceLock::new();
+        static BOLD: std::sync::OnceLock<genpdf::fonts::FontData> =
+            std::sync::OnceLock::new();
+
+        let regular = REGULAR.get_or_init(|| {
+            genpdf::fonts::FontData::new(FONT_REGULAR.to_vec(), None)
+                .expect("вшитый DejaVu Serif Regular должен парситься")
+        });
+        let bold = BOLD.get_or_init(|| {
+            genpdf::fonts::FontData::new(FONT_BOLD.to_vec(), None)
+                .expect("вшитый DejaVu Serif Bold должен парситься")
+        });
+
+        let regular_clone = regular.clone();
+        let bold_clone = bold.clone();
         Ok(genpdf::fonts::FontFamily {
-            regular, bold,
-            italic: regular_italic,
-            bold_italic,
+            regular: regular_clone,
+            bold: bold_clone.clone(),
+            italic: regular.clone(),
+            bold_italic: bold_clone,
         })
     }
 
