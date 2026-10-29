@@ -1610,6 +1610,20 @@ pub mod gui {
         last_dark_theme: Option<bool>,
         /// Кэш рассчитанных итогов. None = инвалидирован.
         totals_cache: Option<TotalsCache>,
+        /// Флаг: черновик изменился и ждёт записи на диск (debounce 500мс).
+        dirty: bool,
+        /// Timestamp последнего изменения документа.
+        last_change: Option<std::time::Instant>,
+        /// Флаг: идёт генерация PDF в фоновом потоке.
+        pdf_in_progress: bool,
+        /// Канал для получения результата фоновой генерации PDF.
+        pdf_result_rx: Option<std::sync::mpsc::Receiver<PdfResult>>,
+    }
+
+    /// Результат фоновой генерации PDF. Шлётся рабочим потоком в основной.
+    enum PdfResult {
+        Ok { pdf_path: PathBuf, history_path: Option<PathBuf> },
+        Err(String),
     }
 
     impl App {
@@ -1642,6 +1656,10 @@ pub mod gui {
                 last_title: initial_title,
                 last_dark_theme: None,
                 totals_cache: None,
+                dirty: false,
+                last_change: None,
+                pdf_in_progress: false,
+                pdf_result_rx: None,
             }
         }
 
@@ -1696,6 +1714,63 @@ pub mod gui {
             }
         }
 
+        /// Помечает черновик как изменённый. Реальная запись через 500мс.
+        fn mark_dirty(&mut self) {
+            self.dirty = true;
+            self.last_change = Some(std::time::Instant::now());
+        }
+
+        /// Debounce: пишет на диск если dirty=true и прошло > 500мс.
+        fn maybe_flush_dirty(&mut self) {
+            if !self.dirty {
+                return;
+            }
+            let ready = self
+                .last_change
+                .map(|t| t.elapsed() >= std::time::Duration::from_millis(500))
+                .unwrap_or(true);
+            if ready {
+                self.save_draft();
+                self.dirty = false;
+                self.last_change = None;
+            }
+        }
+
+        /// Проверяет, не пришёл ли результат фоновой генерации PDF.
+        fn poll_pdf_result(&mut self) {
+            if let Some(rx) = &self.pdf_result_rx {
+                match rx.try_recv() {
+                    Ok(PdfResult::Ok { pdf_path, history_path }) => {
+                        let mut msg = format!("PDF сохранён: {}", pdf_path.display());
+                        if let Some(ron_path) = history_path {
+                            msg.push_str(&format!("\nИстория: {}", ron_path.display()));
+                        }
+                        if let Err(e) = open::that(&pdf_path) {
+                            msg = format!(
+                                "PDF создан, но не удалось открыть просмотрщик: {}",
+                                e
+                            );
+                        }
+                        self.status_message = msg;
+                        self.pdf_in_progress = false;
+                        self.pdf_result_rx = None;
+                    }
+                    Ok(PdfResult::Err(e)) => {
+                        self.status_message = format!("Ошибка генерации PDF: {}", e);
+                        self.pdf_in_progress = false;
+                        self.pdf_result_rx = None;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        self.status_message =
+                            "Ошибка: рабочий поток генерации PDF завершился аварийно".to_string();
+                        self.pdf_in_progress = false;
+                        self.pdf_result_rx = None;
+                    }
+                }
+            }
+        }
+
         fn new_document(&mut self) {
             self.doc = Document {
                 number: model::generate_number(),
@@ -1709,6 +1784,12 @@ pub mod gui {
         }
 
         fn generate_and_open_pdf(&mut self) {
+            // Защита от двойного нажатия.
+            if self.pdf_in_progress {
+                self.status_message =
+                    "Генерация PDF уже идёт, подождите…".to_string();
+                return;
+            }
             if self.doc.filled_count() == 0 {
                 self.status_message = "Нет заполненных строк для формирования PDF".to_string();
                 return;
@@ -1717,36 +1798,42 @@ pub mod gui {
             let filename = format!("Заявка {}.pdf", self.doc.number);
             let path = self.pdf_dir.join(&filename);
 
-            match pdf::generate_pdf(&self.doc, &path) {
-                Ok(()) => {
-                    self.status_message = format!("PDF сохранён: {}", path.display());
+            // Клонируем всё для рабочего потока.
+            let doc = self.doc.clone();
+            let pdf_path = path.clone();
+            let history_dir = self.history_dir.clone();
 
-                    // Сохраняем запись в историю (RON-формат).
-                    let entry = HistoryEntry::from_document(&self.doc, Some(&path));
-                    let store = HistoryStore::new(self.history_dir.clone());
-                    match store.save(&entry) {
-                        Ok(ron_path) => {
-                            self.status_message.push_str(&format!(
-                                "\nИстория: {}", ron_path.display()
-                            ));
-                        }
-                        Err(e) => {
-                            self.status_message.push_str(&format!(
-                                "\nНе удалось сохранить историю: {}", e
-                            ));
-                        }
+            let (tx, rx) = std::sync::mpsc::channel::<PdfResult>();
+
+            self.pdf_in_progress = true;
+            self.pdf_result_rx = Some(rx);
+            self.status_message = format!(
+                "Генерация PDF в фоне… (→ {})", path.display()
+            );
+
+            std::thread::spawn(move || {
+                let result = pdf::generate_pdf(&doc, &pdf_path);
+                match result {
+                    Ok(()) => {
+                        let entry = HistoryEntry::from_document(&doc, Some(&pdf_path));
+                        let store = HistoryStore::new(history_dir);
+                        let history_path = match store.save(&entry) {
+                            Ok(p) => Some(p),
+                            Err(e) => {
+                                eprintln!("Не удалось сохранить историю: {}", e);
+                                None
+                            }
+                        };
+                        let _ = tx.send(PdfResult::Ok {
+                            pdf_path,
+                            history_path,
+                        });
                     }
-
-                    if let Err(e) = open::that(&path) {
-                        self.status_message = format!(
-                            "PDF создан, но не удалось открыть просмотрщик: {}", e
-                        );
+                    Err(e) => {
+                        let _ = tx.send(PdfResult::Err(e));
                     }
                 }
-                Err(e) => {
-                    self.status_message = format!("Ошибка генерации PDF: {}", e);
-                }
-            }
+            });
         }
 
         fn add_empty_line(&mut self) {
@@ -1858,11 +1945,22 @@ pub mod gui {
 
     impl eframe::App for App {
         fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+            // Принудительно сохраняем черновик при выходе — debounce может
+            // оставить dirty=true, если пользователь закрыл окно быстрее
+            // чем через 500мс после последнего нажатия клавиши.
             self.save_draft();
         }
 
         fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
             let ctx = ui.ctx().clone();
+
+            // 1. Сначала проверяем, не пришёл ли результат фоновой генерации PDF.
+            self.poll_pdf_result();
+
+            // Если генерация идёт — просим egui перерисовать.
+            if self.pdf_in_progress {
+                ctx.request_repaint();
+            }
 
             // Тему применяем только при изменении флага dark_theme — не каждый кадр.
             // Тема не «слетает» сама, egui хранит её в ctx.
@@ -1922,7 +2020,14 @@ pub mod gui {
 
             egui::Panel::bottom("status_bar").show(ui, |ui| {
                 ui.add_space(2.0);
-                ui.horizontal(|ui| { ui.label(&self.status_message); });
+                ui.horizontal(|ui| {
+                    if self.pdf_in_progress {
+                        ui.spinner();
+                        ui.label("Генерация PDF в фоне…");
+                        ui.separator();
+                    }
+                    ui.label(&self.status_message);
+                });
                 ui.add_space(2.0);
             });
 
@@ -1984,11 +2089,16 @@ pub mod gui {
 
             self.ensure_trailing_empty();
 
+            // Проверяем, не изменился ли документ. Если да — помечаем как dirty.
+            // Реальная запись на диск через debounce 500мс.
             let cur_sig = filled_signature(&self.doc);
             if cur_sig != self.last_filled_signature {
                 self.last_filled_signature = cur_sig;
-                self.save_draft();
+                self.mark_dirty();
             }
+
+            // Debounce: если с последнего изменения прошло > 500мс — пишем.
+            self.maybe_flush_dirty();
         }
     }
 
